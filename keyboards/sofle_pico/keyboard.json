@@ -154,6 +154,7 @@
         },
         "transport": {
             "sync": {
+                "indicators": true,
                 "layer_state": true,
                 "matrix_state": true
             }
@@ -185,7 +186,7 @@
                 {"label": "9", "matrix": [5, 2], "x": 12, "y": 0.3},
                 {"label": "0", "matrix": [5, 1], "x": 13, "y": 0.7},
                 {"label": "`", "matrix": [5, 0], "x": 14, "y": 0.7},
-                {"label": "Esc", "matrix": [1, 0], "x": 0, "y": 1.7},
+                {"label": "Tab", "matrix": [1, 0], "x": 0, "y": 1.7},
                 {"label": "Q", "matrix": [1, 1], "x": 1, "y": 1.7},
                 {"label": "W", "matrix": [1, 2], "x": 2, "y": 1.3},
                 {"label": "E", "matrix": [1, 3], "x": 3, "y": 1},
@@ -197,7 +198,7 @@
                 {"label": "O", "matrix": [6, 2], "x": 12, "y": 1.3},
                 {"label": "P", "matrix": [6, 1], "x": 13, "y": 1.7},
                 {"label": "Bspc", "matrix": [6, 0], "x": 14, "y": 1.7},
-                {"label": "Tab", "matrix": [2, 0], "x": 0, "y": 2.7},
+                {"label": "Esc", "matrix": [2, 0], "x": 0, "y": 2.7},
                 {"label": "A", "matrix": [2, 1], "x": 1, "y": 2.7},
                 {"label": "S", "matrix": [2, 2], "x": 2, "y": 2.3},
                 {"label": "D", "matrix": [2, 3], "x": 3, "y": 2},
