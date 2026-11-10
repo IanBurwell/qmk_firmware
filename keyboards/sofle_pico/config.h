@@ -30,3 +30,5 @@
 
 /* Custom split transaction ID to sync GP24 user button and OLED/RGB toggle state */
 #define SPLIT_TRANSACTION_IDS_USER USR_BTN_SYNC
+#define RPC_M2S_BUFFER_SIZE 72
+#define VIA_EEPROM_CUSTOM_CONFIG_SIZE 4
