@@ -127,8 +127,9 @@ static void populate_half_keys(bool is_left, layer_state_t active_mask, uint8_t 
         }
     }
     uint8_t enc_idx = is_left ? 0 : 1;
-    *out_ccw        = resolve_active_encoder(active_mask, top_layer, enc_idx, false);
-    *out_cw         = resolve_active_encoder(active_mask, top_layer, enc_idx, true);
+    // Right half PCB is flipped, reversing physical encoder A/B rotation relative to QMK CW/CCW
+    *out_ccw        = resolve_active_encoder(active_mask, top_layer, enc_idx, !is_left);
+    *out_cw         = resolve_active_encoder(active_mask, top_layer, enc_idx, is_left);
 }
 
 #if defined(VIA_ENABLE) && (VIA_EEPROM_CUSTOM_CONFIG_SIZE >= 4)
@@ -839,6 +840,16 @@ static void fb_draw_cols7(uint8_t *fb, uint8_t x, uint8_t y, const uint8_t *cols
 
 static void fb_draw_cell(uint8_t *fb, uint8_t cx, uint8_t cy, const char label[4], bool active, bool is_knob, bool is_empty) {
     if (is_empty || label[0] == '\0') {
+        if (active) {
+            for (uint8_t dx = 1; dx <= 7; dx++) {
+                fb_set_pixel(fb, (uint8_t)(cx + dx), cy, true);
+                fb_set_pixel(fb, (uint8_t)(cx + dx), (uint8_t)(cy + 13), true);
+            }
+            for (uint8_t dy = 1; dy <= 12; dy++) {
+                fb_set_pixel(fb, cx, (uint8_t)(cy + dy), true);
+                fb_set_pixel(fb, (uint8_t)(cx + 8), (uint8_t)(cy + dy), true);
+            }
+        }
         fb_set_pixel(fb, (uint8_t)(cx + 4), (uint8_t)(cy + 7), true);
         return;
     }
@@ -901,25 +912,52 @@ static void fb_draw_cell(uint8_t *fb, uint8_t cx, uint8_t cy, const char label[4
         }
     } else {
         uint8_t gA[3], gB[3];
-        if (label[0] == '!' || label[0] == '1') {
+        if (active) {
+            const uint8_t f2[2] = {0x7F, 0x09};
+            if (label[0] == '!' || label[0] == '1') {
+                uint8_t c0 = (label[0] == '!') ? 0x5F : 0x7F;
+                get_glyph3x7(label[2], gB);
+                fb_draw_cols7(fb, (uint8_t)(cx + 1), ty, &c0, 1, true);
+                fb_draw_cols7(fb, (uint8_t)(cx + 3), ty, f2, 2, true);
+                if (label[2] == '1') {
+                    uint8_t c2 = 0x7F;
+                    fb_draw_cols7(fb, (uint8_t)(cx + 7), ty, &c2, 1, true);
+                } else {
+                    gB[2] &= 0x3E;
+                    fb_draw_cols7(fb, (uint8_t)(cx + 6), ty, gB, 3, true);
+                }
+            } else {
+                uint8_t c1 = (label[1] == '!') ? 0x5F : 0x7F;
+                get_glyph3x7(label[2], gB);
+                fb_draw_cols7(fb, (uint8_t)(cx + 1), ty, f2, 2, true);
+                fb_draw_cols7(fb, (uint8_t)(cx + 4), ty, &c1, 1, true);
+                if (label[2] == '1') {
+                    uint8_t c2 = 0x7F;
+                    fb_draw_cols7(fb, (uint8_t)(cx + 7), ty, &c2, 1, true);
+                } else {
+                    gB[2] &= 0x3E;
+                    fb_draw_cols7(fb, (uint8_t)(cx + 6), ty, gB, 3, true);
+                }
+            }
+        } else if (label[0] == '!' || label[0] == '1') {
             uint8_t c0 = (label[0] == '!') ? 0x5F : 0x7F;
             get_glyph3x7(label[1], gA);
             get_glyph3x7(label[2], gB);
-            fb_draw_cols7(fb, cx, ty, &c0, 1, active);
-            fb_draw_cols7(fb, (uint8_t)(cx + 2), ty, gA, 3, active);
-            fb_draw_cols7(fb, (uint8_t)(cx + 6), ty, gB, 3, active);
+            fb_draw_cols7(fb, cx, ty, &c0, 1, false);
+            fb_draw_cols7(fb, (uint8_t)(cx + 2), ty, gA, 3, false);
+            fb_draw_cols7(fb, (uint8_t)(cx + 6), ty, gB, 3, false);
         } else {
             uint8_t c1 = (label[1] == '!') ? 0x5F : 0x7F;
             get_glyph3x7(label[0], gA);
             get_glyph3x7(label[2], gB);
-            fb_draw_cols7(fb, cx, ty, gA, 3, active);
-            fb_draw_cols7(fb, (uint8_t)(cx + 4), ty, &c1, 1, active);
-            fb_draw_cols7(fb, (uint8_t)(cx + 6), ty, gB, 3, active);
+            fb_draw_cols7(fb, cx, ty, gA, 3, false);
+            fb_draw_cols7(fb, (uint8_t)(cx + 4), ty, &c1, 1, false);
+            fb_draw_cols7(fb, (uint8_t)(cx + 6), ty, gB, 3, false);
         }
     }
 }
 
-static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, uint8_t mods, bool caps, const uint16_t keys[5][6], uint16_t enc_ccw, uint16_t enc_cw) {
+static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, uint8_t mods, bool caps, const uint8_t pressed_rows[5], const uint16_t keys[5][6], uint16_t enc_ccw, uint16_t enc_cw) {
     memset(fb, 0, OLED_MATRIX_SIZE);
 
     bool shift = (mods & MOD_MASK_SHIFT) != 0;
@@ -980,11 +1018,12 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, uin
 
     for (uint8_t r = 0; r < 5; r++) {
         for (uint8_t disp_c = 0; disp_c < 6; disp_c++) {
-            uint8_t  mat_c = is_left ? disp_c : (uint8_t)(5 - disp_c);
-            uint16_t kc    = keys[r][mat_c];
+            uint8_t  mat_c   = is_left ? disp_c : (uint8_t)(5 - disp_c);
+            uint16_t kc      = keys[r][mat_c];
             char     lbl[4];
             format_keycode_label(kc, shift, caps, lbl);
-            bool    act     = is_kc_active_pill(kc, top_layer, mods, caps);
+            bool    pressed = (pressed_rows[r] & (1U << mat_c)) != 0;
+            bool    act     = pressed || is_kc_active_pill(kc, top_layer, mods, caps);
             uint8_t cx      = col_x[disp_c];
             bool    is_knob = (r == 4 && mat_c == 5);
             uint8_t cy;
@@ -1035,6 +1074,7 @@ typedef struct {
     uint8_t  top_layer;
     uint8_t  mods;
     bool     caps;
+    uint8_t  pressed_rows[5];
     uint16_t keys[5][6];
     uint16_t enc_ccw;
     uint16_t enc_cw;
@@ -1053,9 +1093,15 @@ bool oled_task_user(void) {
     uint8_t  top_layer;
     uint8_t  mods;
     bool     caps;
+    uint8_t  pressed_rows[5];
     uint16_t cur_keys[5][6];
     uint16_t cur_ccw;
     uint16_t cur_cw;
+
+    uint8_t row_offset = is_left ? 0 : 5;
+    for (uint8_t r = 0; r < 5; r++) {
+        pressed_rows[r] = (uint8_t)(matrix_get_row((uint8_t)(r + row_offset)) & 0x3F);
+    }
 
     if (!is_keyboard_master() && slave_has_hdr && slave_has_keys) {
         top_layer = slave_hdr_state.top_layer;
@@ -1075,15 +1121,16 @@ bool oled_task_user(void) {
         populate_half_keys(is_left, active_mask, top_layer, cur_keys, &cur_ccw, &cur_cw);
     }
 
-    bool changed = !oled_cache.valid || (oled_cache.is_left != is_left) || (oled_cache.top_layer != top_layer) || (oled_cache.mods != mods) || (oled_cache.caps != caps) || (oled_cache.enc_ccw != cur_ccw) || (oled_cache.enc_cw != cur_cw) || (memcmp(oled_cache.keys, cur_keys, sizeof(cur_keys)) != 0);
+    bool changed = !oled_cache.valid || (oled_cache.is_left != is_left) || (oled_cache.top_layer != top_layer) || (oled_cache.mods != mods) || (oled_cache.caps != caps) || (oled_cache.enc_ccw != cur_ccw) || (oled_cache.enc_cw != cur_cw) || (memcmp(oled_cache.pressed_rows, pressed_rows, sizeof(pressed_rows)) != 0) || (memcmp(oled_cache.keys, cur_keys, sizeof(cur_keys)) != 0);
 
     if (changed) {
-        render_oled_layout(oled_frame, is_left, top_layer, mods, caps, cur_keys, cur_ccw, cur_cw);
+        render_oled_layout(oled_frame, is_left, top_layer, mods, caps, pressed_rows, cur_keys, cur_ccw, cur_cw);
         oled_cache.valid     = true;
         oled_cache.is_left   = is_left;
         oled_cache.top_layer = top_layer;
         oled_cache.mods      = mods;
         oled_cache.caps      = caps;
+        memcpy(oled_cache.pressed_rows, pressed_rows, sizeof(oled_cache.pressed_rows));
         memcpy(oled_cache.keys, cur_keys, sizeof(oled_cache.keys));
         oled_cache.enc_ccw = cur_ccw;
         oled_cache.enc_cw  = cur_cw;
