@@ -2,6 +2,7 @@
 #include "solid_color_anim.h"
 #include "alpha_mods_anim.h"
 #include "gradient_up_down_anim.h"
+#include "gradient_up_down_val_anim.h"
 #include "gradient_left_right_anim.h"
 #include "breathing_anim.h"
 #include "colorband_sat_anim.h"
