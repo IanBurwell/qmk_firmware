@@ -1,0 +1,12 @@
+[Unit]
+Description=Sofle Pico Dual-USB Split Sync Bridge
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/qmk_firmware/keyboards/sofle_pico/keymaps/default/host_sync/sofle_sync.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

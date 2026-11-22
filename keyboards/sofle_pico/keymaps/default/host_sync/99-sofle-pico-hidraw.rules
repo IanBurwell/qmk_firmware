@@ -1,0 +1,2 @@
+# Allow unprivileged access to Sofle Pico Raw HID endpoints on Linux
+KERNEL=="hidraw*", ATTRS{idVendor}=="4a54", ATTRS{idProduct}=="5350", MODE="0660", TAG+="uaccess"

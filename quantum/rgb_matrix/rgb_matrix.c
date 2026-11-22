@@ -519,8 +519,8 @@ void rgb_matrix_init(void) {
 #endif // RGB_MATRIX_KEYREACTIVE_ENABLED
 
     eeconfig_init_rgb_matrix();
-    if (!rgb_matrix_config.mode) {
-        dprintf("rgb_matrix_init_drivers rgb_matrix_config.mode = 0. Write default values to EEPROM.\n");
+    if (!rgb_matrix_config.mode || rgb_matrix_config.mode >= RGB_MATRIX_EFFECT_MAX || rgb_matrix_config.flags == 0) {
+        dprintf("rgb_matrix_init_drivers invalid rgb_matrix_config. Write default values to EEPROM.\n");
         eeconfig_update_rgb_matrix_default();
     }
     eeconfig_debug_rgb_matrix(); // display current eeprom values

@@ -4,11 +4,24 @@
 #include QMK_KEYBOARD_H
 #include "transactions.h"
 #include "keymap_introspection.h"
+#include "split_util.h"
+#include "sync_timer.h"
 #include <string.h>
 
 #ifdef VIA_ENABLE
 #    include "via.h"
 #    include "dynamic_keymap.h"
+#endif
+
+#ifdef RAW_ENABLE
+#    include "raw_hid.h"
+#    ifndef RAW_EPSIZE
+#        define RAW_EPSIZE 32
+#    endif
+#endif
+
+#ifdef RGB_MATRIX_ENABLE
+#    include "rgb_matrix.h"
 #endif
 
 #define USR_BTN_PIN GP24
@@ -61,11 +74,15 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][NUM_DIRECTIONS] = {
     [_ADJUST] = {ENCODER_CCW_CW(_______, _______), ENCODER_CCW_CW(_______, _______)},
 };
 
+#define SLAVE_HDR_LIGHTS_OFF  0x01
+#define SLAVE_HDR_CAPS_LOCK   0x02
+#define SLAVE_HDR_WAKE_ACTIVE 0x04
+
 typedef struct {
-    bool    lights_disabled;
+    uint8_t flags;
     uint8_t top_layer;
     uint8_t mods;
-    bool    caps_lock;
+    uint8_t reserved;
 } slave_sync_hdr_t;
 
 typedef struct {
@@ -78,7 +95,7 @@ typedef struct {
 _Static_assert(sizeof(slave_sync_packet_t) <= RPC_M2S_BUFFER_SIZE, "slave_sync_packet_t exceeds RPC_M2S_BUFFER_SIZE");
 
 static bool             lights_disabled  = false;
-static slave_sync_hdr_t slave_hdr_state  = {false, 0, 0, false};
+static slave_sync_hdr_t slave_hdr_state  = {0, 0, 0, 0};
 static uint16_t         slave_keys[5][6] = {{0}};
 static uint16_t         slave_enc_ccw    = KC_NO;
 static uint16_t         slave_enc_cw     = KC_NO;
@@ -162,16 +179,24 @@ static uint32_t compute_flash_keymap_hash(void) {
 }
 #endif
 
+static void wake_local_displays_and_rgb(void) {
+    set_activity_timestamps(sync_timer_read32(), last_encoder_activity_time(), last_pointing_device_activity_time());
+    oled_on();
+#ifdef RGB_MATRIX_ENABLE
+    rgb_matrix_set_suspend_state(false);
+#endif
+}
+
 static void usr_btn_sync_slave_handler(uint8_t in_buflen, const void *in_data, uint8_t out_buflen, void *out_data) {
     if (in_buflen >= sizeof(slave_sync_hdr_t)) {
         slave_sync_hdr_t hdr;
         memcpy(&hdr, in_data, sizeof(hdr));
         bool prev_disabled = lights_disabled;
-        lights_disabled    = hdr.lights_disabled;
+        lights_disabled    = (hdr.flags & SLAVE_HDR_LIGHTS_OFF) != 0;
         slave_hdr_state    = hdr;
         slave_has_hdr      = true;
-        if (prev_disabled && !lights_disabled) {
-            oled_on();
+        if (!lights_disabled && (prev_disabled || (hdr.flags & SLAVE_HDR_WAKE_ACTIVE) != 0)) {
+            wake_local_displays_and_rgb();
         }
     }
     if (in_buflen >= sizeof(slave_sync_packet_t)) {
@@ -188,10 +213,410 @@ static void usr_btn_sync_slave_handler(uint8_t in_buflen, const void *in_data, u
     }
 }
 
+typedef enum {
+    OLED_CONN_TRRS = 0,
+    OLED_CONN_SYNC,
+    OLED_CONN_WAIT,
+    OLED_CONN_DISC,
+} oled_conn_mode_t;
+
+typedef struct {
+    bool    valid;
+    bool    lights_disabled;
+    uint8_t enable;
+    uint8_t mode;
+    uint8_t h;
+    uint8_t s;
+    uint8_t v;
+    uint8_t speed;
+} rgb_sync_snapshot_t;
+
+#define RAW_SYNC_CMD_ID           0xF0
+#define RAW_SYNC_MAGIC_0          0x53 // 'S'
+#define RAW_SYNC_MAGIC_1          0x50 // 'P'
+#define RAW_MSG_HOST_PING         0x01
+#define RAW_MSG_HALF_STATE        0x02
+#define RAW_MSG_IDENTIFY          0x03
+#define RAW_MSG_BOOTLOADER        0x04
+#define RAW_BOOTLOADER_DELAY_MS   60
+#define HOST_SYNC_TIMEOUT_MS      2500
+#define ACTIVITY_WAKE_THROTTLE_MS 1000
+
+#define HALF_FLAG_LOWER_HELD    0x01
+#define HALF_FLAG_UPPER_HELD    0x02
+#define HALF_FLAG_LIGHTS_OFF    0x04
+#define HALF_FLAG_RGB_CHANGED   0x08
+#define HALF_FLAG_SYNC_TIMER    0x10
+#define HALF_FLAG_PING_REPLY    0x20
+#define HALF_FLAG_ACTIVITY_WAKE 0x40
+
+static bool                host_service_connected   = false;
+static bool                host_peer_connected      = false;
+static uint32_t            host_service_last_rx     = 0;
+static bool                bootloader_pending       = false;
+static uint32_t            bootloader_req_time      = 0;
+static uint32_t            last_activity_sync_tx    = 0;
+static bool                last_activity_sync_valid = false;
+static bool                local_lower_held         = false;
+static bool                local_upper_held         = false;
+static bool                remote_lower_held        = false;
+static bool                remote_upper_held        = false;
+static uint8_t             remote_mods              = 0;
+static uint8_t             last_sent_mods           = 0;
+static uint8_t             local_rgb_seq            = 0;
+static uint8_t             local_state_seq          = 0;
+static rgb_sync_snapshot_t last_rgb_snapshot        = {0};
+
+static uint8_t get_local_mods(void) {
+    uint8_t mods = get_mods() | get_weak_mods();
+#ifndef NO_ACTION_ONESHOT
+    mods |= get_oneshot_mods();
+#endif
+    return mods;
+}
+
+static void snapshot_current_rgb(rgb_sync_snapshot_t *out) {
+    out->valid           = true;
+    out->lights_disabled = lights_disabled;
+#ifdef RGB_MATRIX_ENABLE
+    hsv_t hsv   = rgb_matrix_get_hsv();
+    out->enable = rgb_matrix_is_enabled() ? 1 : 0;
+    out->mode   = rgb_matrix_get_mode();
+    out->h      = hsv.h;
+    out->s      = hsv.s;
+    out->v      = hsv.v;
+    out->speed  = rgb_matrix_get_speed();
+#else
+    out->enable = 0;
+    out->mode   = 0;
+    out->h      = 0;
+    out->s      = 0;
+    out->v      = 0;
+    out->speed  = 0;
+#endif
+}
+
+static void apply_combined_tri_layers(void) {
+    bool want_lower = local_lower_held || remote_lower_held;
+    bool want_upper = local_upper_held || remote_upper_held;
+    bool changed    = false;
+
+    if (want_lower && !layer_state_is(_LOWER)) {
+        layer_on(_LOWER);
+        changed = true;
+    } else if (!want_lower && layer_state_is(_LOWER)) {
+        layer_off(_LOWER);
+        changed = true;
+    }
+
+    if (want_upper && !layer_state_is(_RAISE)) {
+        layer_on(_RAISE);
+        changed = true;
+    } else if (!want_upper && layer_state_is(_RAISE)) {
+        layer_off(_RAISE);
+        changed = true;
+    }
+
+    bool want_adjust = want_lower && want_upper;
+    if (changed || (layer_state_is(_ADJUST) != want_adjust)) {
+        update_tri_layer(_LOWER, _RAISE, _ADJUST);
+    }
+}
+
+static void host_sync_send_state(bool rgb_changed, bool sync_rgb_timer, bool is_reply, bool activity_wake) {
+#ifdef RAW_ENABLE
+    if (!is_keyboard_master() || is_transport_connected() || !host_service_connected) {
+        return;
+    }
+    if (!is_reply && !host_peer_connected) {
+        return;
+    }
+
+    uint8_t pkt[RAW_EPSIZE];
+    memset(pkt, 0, sizeof(pkt));
+
+    rgb_sync_snapshot_t cur_rgb;
+    snapshot_current_rgb(&cur_rgb);
+
+    uint8_t flags = 0;
+    if (local_lower_held) flags |= HALF_FLAG_LOWER_HELD;
+    if (local_upper_held) flags |= HALF_FLAG_UPPER_HELD;
+    if (cur_rgb.lights_disabled) flags |= HALF_FLAG_LIGHTS_OFF;
+    if (rgb_changed) {
+        flags |= HALF_FLAG_RGB_CHANGED;
+        local_rgb_seq++;
+    }
+    if (sync_rgb_timer) flags |= HALF_FLAG_SYNC_TIMER;
+    if (is_reply) flags |= HALF_FLAG_PING_REPLY;
+    if (activity_wake) {
+        flags |= HALF_FLAG_ACTIVITY_WAKE;
+        last_activity_sync_tx    = timer_read32();
+        last_activity_sync_valid = true;
+    }
+
+    local_state_seq++;
+
+    pkt[0]  = RAW_SYNC_CMD_ID;
+    pkt[1]  = RAW_SYNC_MAGIC_0;
+    pkt[2]  = RAW_SYNC_MAGIC_1;
+    pkt[3]  = RAW_MSG_HALF_STATE;
+    pkt[4]  = is_keyboard_left() ? 1 : 0;
+    pkt[5]  = flags;
+    pkt[6]  = get_local_mods();
+    pkt[7]  = cur_rgb.enable;
+    pkt[8]  = cur_rgb.mode;
+    pkt[9]  = cur_rgb.h;
+    pkt[10] = cur_rgb.s;
+    pkt[11] = cur_rgb.v;
+    pkt[12] = cur_rgb.speed;
+    pkt[13] = local_rgb_seq;
+    pkt[14] = local_state_seq;
+
+    raw_hid_send(pkt, sizeof(pkt));
+#else
+    (void)rgb_changed;
+    (void)sync_rgb_timer;
+    (void)is_reply;
+    (void)activity_wake;
+#endif
+}
+
+static void clear_host_sync_state(void) {
+    bool had_remote = host_service_connected || host_peer_connected || remote_lower_held || remote_upper_held || (remote_mods != 0);
+    host_service_connected   = false;
+    host_peer_connected      = false;
+    last_activity_sync_valid = false;
+    remote_lower_held        = false;
+    remote_upper_held        = false;
+    remote_mods              = 0;
+    if (had_remote) {
+        apply_combined_tri_layers();
+    }
+}
+
+#if defined(VIA_ENABLE) && defined(RAW_ENABLE)
+bool via_command_kb(uint8_t *data, uint8_t length) {
+    if (length < 15 || data[0] != RAW_SYNC_CMD_ID || data[1] != RAW_SYNC_MAGIC_0 || data[2] != RAW_SYNC_MAGIC_1) {
+        return false;
+    }
+
+    if (!is_keyboard_master()) {
+        return true;
+    }
+
+    uint8_t msg_type = data[3];
+    if (msg_type == RAW_MSG_IDENTIFY) {
+        uint8_t pkt[RAW_EPSIZE];
+        memset(pkt, 0, sizeof(pkt));
+        uint32_t up = timer_read32();
+        pkt[0]      = RAW_SYNC_CMD_ID;
+        pkt[1]      = RAW_SYNC_MAGIC_0;
+        pkt[2]      = RAW_SYNC_MAGIC_1;
+        pkt[3]      = RAW_MSG_IDENTIFY;
+        pkt[4]      = is_keyboard_left() ? 1 : 0;
+        pkt[5]      = is_transport_connected() ? 1 : 0;
+        pkt[6]      = data[4];
+        pkt[7]      = data[5];
+        pkt[8]      = (uint8_t)(up & 0xFF);
+        pkt[9]      = (uint8_t)((up >> 8) & 0xFF);
+        pkt[10]     = (uint8_t)((up >> 16) & 0xFF);
+        pkt[11]     = (uint8_t)((up >> 24) & 0xFF);
+        raw_hid_send(pkt, sizeof(pkt));
+        return true;
+    }
+
+    if (msg_type == RAW_MSG_BOOTLOADER) {
+        uint8_t my_side  = is_keyboard_left() ? 1 : 0;
+        bool    magic_ok = (data[5] == 'B' && data[6] == 'O' && data[7] == 'O' && data[8] == 'T');
+        bool    side_ok  = (data[4] == 2 || data[4] == my_side);
+        bool    accepted = magic_ok && side_ok;
+
+        uint8_t pkt[RAW_EPSIZE];
+        memset(pkt, 0, sizeof(pkt));
+        pkt[0] = RAW_SYNC_CMD_ID;
+        pkt[1] = RAW_SYNC_MAGIC_0;
+        pkt[2] = RAW_SYNC_MAGIC_1;
+        pkt[3] = RAW_MSG_BOOTLOADER;
+        pkt[4] = my_side;
+        pkt[5] = accepted ? 1 : 0;
+        pkt[6] = data[9];
+        pkt[7] = data[10];
+        raw_hid_send(pkt, sizeof(pkt));
+
+        if (accepted) {
+            bootloader_pending  = true;
+            bootloader_req_time = timer_read32();
+        }
+        return true;
+    }
+
+    if (is_transport_connected()) {
+        return true;
+    }
+
+    if (msg_type == RAW_MSG_HOST_PING) {
+        host_service_last_rx   = timer_read32();
+        host_service_connected = true;
+        bool new_peer          = (data[4] != 0);
+        if (host_peer_connected && !new_peer) {
+            remote_lower_held = false;
+            remote_upper_held = false;
+            remote_mods       = 0;
+            apply_combined_tri_layers();
+        }
+        host_peer_connected = new_peer;
+
+        if (data[5] != 0) {
+            bool auth_rgb = (data[6] != 0);
+            last_sent_mods = get_local_mods();
+            snapshot_current_rgb(&last_rgb_snapshot);
+            host_sync_send_state(auth_rgb, auth_rgb, true, false);
+        }
+        return true;
+    }
+
+    if (msg_type == RAW_MSG_HALF_STATE) {
+        bool sender_is_left = (data[4] != 0);
+        if (sender_is_left == is_keyboard_left()) {
+            return true;
+        }
+
+        host_service_last_rx   = timer_read32();
+        host_service_connected = true;
+        host_peer_connected    = true;
+
+        uint8_t flags     = data[5];
+        remote_lower_held = (flags & HALF_FLAG_LOWER_HELD) != 0;
+        remote_upper_held = (flags & HALF_FLAG_UPPER_HELD) != 0;
+        remote_mods       = data[6];
+        apply_combined_tri_layers();
+
+        if ((flags & HALF_FLAG_RGB_CHANGED) != 0) {
+            bool prev_lights_disabled = lights_disabled;
+            bool new_lights_disabled  = (flags & HALF_FLAG_LIGHTS_OFF) != 0;
+            bool new_enable           = (data[7] != 0);
+            uint8_t new_mode          = data[8];
+            uint8_t new_hue           = data[9];
+            uint8_t new_sat           = data[10];
+            uint8_t new_val           = data[11];
+            uint8_t new_speed         = data[12];
+
+            lights_disabled = new_lights_disabled;
+            if (new_lights_disabled) {
+                oled_off();
+#    ifdef RGB_MATRIX_ENABLE
+                rgb_matrix_disable_noeeprom();
+#    endif
+            } else {
+                if (prev_lights_disabled) {
+                    wake_local_displays_and_rgb();
+                }
+#    ifdef RGB_MATRIX_ENABLE
+                if (new_enable) {
+                    if (!rgb_matrix_is_enabled()) {
+                        if (prev_lights_disabled) {
+                            rgb_matrix_enable_noeeprom();
+                        } else {
+                            rgb_matrix_enable();
+                        }
+                    }
+                    if (new_mode < 1 || new_mode >= RGB_MATRIX_EFFECT_MAX) {
+                        new_mode = RGB_MATRIX_SOLID_COLOR;
+                    }
+                    if (rgb_matrix_get_mode() != new_mode) {
+                        rgb_matrix_mode(new_mode);
+                    }
+                    hsv_t cur_hsv = rgb_matrix_get_hsv();
+                    if (cur_hsv.h != new_hue || cur_hsv.s != new_sat || cur_hsv.v != new_val) {
+                        rgb_matrix_sethsv(new_hue, new_sat, new_val);
+                    }
+                    if (rgb_matrix_get_speed() != new_speed) {
+                        rgb_matrix_set_speed(new_speed);
+                    }
+                    if ((flags & HALF_FLAG_SYNC_TIMER) != 0) {
+                        g_rgb_timer = 0;
+                    }
+                } else if (rgb_matrix_is_enabled()) {
+                    rgb_matrix_disable();
+                }
+#    endif
+            }
+            snapshot_current_rgb(&last_rgb_snapshot);
+        }
+
+        if ((flags & HALF_FLAG_ACTIVITY_WAKE) != 0 && !lights_disabled) {
+            wake_local_displays_and_rgb();
+        }
+        return true;
+    }
+
+    return true;
+}
+#endif
+
+static void sync_local_state_if_needed(void) {
+    if (!is_keyboard_master() || is_transport_connected()) {
+        return;
+    }
+    uint8_t             cur_mods = get_local_mods();
+    rgb_sync_snapshot_t cur_rgb;
+    snapshot_current_rgb(&cur_rgb);
+
+    bool mods_changed = (cur_mods != last_sent_mods);
+    bool mode_changed = !last_rgb_snapshot.valid || (cur_rgb.mode != last_rgb_snapshot.mode) || (cur_rgb.enable != last_rgb_snapshot.enable) || (cur_rgb.lights_disabled != last_rgb_snapshot.lights_disabled);
+    bool rgb_changed  = !last_rgb_snapshot.valid || (memcmp(&cur_rgb, &last_rgb_snapshot, sizeof(cur_rgb)) != 0);
+
+    if (mods_changed || rgb_changed) {
+        last_sent_mods    = cur_mods;
+        last_rgb_snapshot = cur_rgb;
+        host_sync_send_state(rgb_changed, mode_changed, false, true);
+    }
+}
+
+bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+    if (is_keyboard_master() && !is_transport_connected()) {
+        if (keycode == QK_TRI_LAYER_LOWER) {
+            local_lower_held = record->event.pressed;
+            apply_combined_tri_layers();
+            last_sent_mods = get_local_mods();
+            host_sync_send_state(false, false, false, record->event.pressed);
+            return false;
+        }
+        if (keycode == QK_TRI_LAYER_UPPER) {
+            local_upper_held = record->event.pressed;
+            apply_combined_tri_layers();
+            last_sent_mods = get_local_mods();
+            host_sync_send_state(false, false, false, record->event.pressed);
+            return false;
+        }
+        if (record->event.pressed && host_service_connected && host_peer_connected) {
+            if (!last_activity_sync_valid || timer_elapsed32(last_activity_sync_tx) >= ACTIVITY_WAKE_THROTTLE_MS) {
+                last_sent_mods = get_local_mods();
+                host_sync_send_state(false, false, false, true);
+            }
+        }
+    }
+    return true;
+}
+
+void post_process_record_user(uint16_t keycode, keyrecord_t *record) {
+    (void)keycode;
+    (void)record;
+    sync_local_state_if_needed();
+}
+
 void keyboard_post_init_user(void) {
     gpio_set_pin_output(USR_LED_PIN);
     gpio_set_pin_input_high(USR_BTN_PIN);
     transaction_register_rpc(USR_BTN_SYNC, usr_btn_sync_slave_handler);
+
+#if defined(RGB_MATRIX_ENABLE)
+    if (is_keyboard_master()) {
+        if (!rgb_matrix_config.mode || rgb_matrix_config.mode >= RGB_MATRIX_EFFECT_MAX || rgb_matrix_config.flags == 0) {
+            eeconfig_update_rgb_matrix_default();
+        }
+    }
+#endif
 
 #if defined(VIA_ENABLE) && (VIA_EEPROM_CUSTOM_CONFIG_SIZE >= 4)
     if (is_keyboard_master()) {
@@ -204,12 +629,35 @@ void keyboard_post_init_user(void) {
         }
     }
 #endif
+
+    snapshot_current_rgb(&last_rgb_snapshot);
+    last_sent_mods = get_local_mods();
 }
 
 void housekeeping_task_user(void) {
     if (is_keyboard_master()) {
-        // Solid LED on master half
-        gpio_write_pin_high(USR_LED_PIN);
+        if (bootloader_pending && timer_elapsed32(bootloader_req_time) >= RAW_BOOTLOADER_DELAY_MS) {
+            bootloader_pending = false;
+            oled_off();
+            reset_keyboard();
+            return;
+        }
+        bool trrs_connected = is_transport_connected();
+        if (trrs_connected) {
+            clear_host_sync_state();
+            // Solid LED on TRRS master half
+            gpio_write_pin_high(USR_LED_PIN);
+        } else {
+            if (host_service_connected && timer_elapsed32(host_service_last_rx) > HOST_SYNC_TIMEOUT_MS) {
+                clear_host_sync_state();
+            }
+            // Dual-USB mode LED indicator: solid on Left when synced, Caps Lock on Right
+            if (is_keyboard_left()) {
+                gpio_write_pin(USR_LED_PIN, host_service_connected && host_peer_connected);
+            } else {
+                gpio_write_pin(USR_LED_PIN, host_keyboard_led_state().caps_lock);
+            }
+        }
 
         static uint16_t poll_timer               = 0;
         static bool     last_master_btn          = false;
@@ -225,59 +673,70 @@ void housekeeping_task_user(void) {
             bool master_btn = !gpio_read_pin(USR_BTN_PIN);
             bool slave_btn  = false;
 
-            // Master button: toggle OLEDs and RGB LEDs on/off
+            // User button (GP24):
+            // - Left half (or TRRS master): toggle OLED & RGB lights
+            // - Right half (Dual-USB): cycle RGB Matrix profile (synced to Left if paired)
             if (master_btn && !last_master_btn) {
-                lights_disabled = !lights_disabled;
-                if (lights_disabled) {
-                    rgb_matrix_disable_noeeprom();
-                    oled_off();
+                if (trrs_connected || is_keyboard_left()) {
+                    lights_disabled = !lights_disabled;
+                    if (lights_disabled) {
+                        rgb_matrix_disable_noeeprom();
+                        oled_off();
+                    } else {
+                        rgb_matrix_enable_noeeprom();
+                        wake_local_displays_and_rgb();
+                    }
                 } else {
-                    rgb_matrix_enable_noeeprom();
-                    oled_on();
+                    rgb_matrix_step();
                 }
             }
             last_master_btn = master_btn;
 
-            layer_state_t active_mask = layer_state | default_layer_state;
-            uint8_t       top_layer   = get_highest_layer(active_mask);
-            uint8_t       mods        = get_mods() | get_weak_mods();
-#ifndef NO_ACTION_ONESHOT
-            mods |= get_oneshot_mods();
-#endif
-            bool caps = host_keyboard_led_state().caps_lock;
+            if (trrs_connected) {
+                layer_state_t active_mask = layer_state | default_layer_state;
+                uint8_t       top_layer   = get_highest_layer(active_mask);
+                uint8_t       mods        = get_local_mods();
+                bool          caps        = host_keyboard_led_state().caps_lock;
+                uint8_t       hdr_flags   = 0;
+                if (lights_disabled) hdr_flags |= SLAVE_HDR_LIGHTS_OFF;
+                if (caps) hdr_flags |= SLAVE_HDR_CAPS_LOCK;
+                if (!lights_disabled && last_input_activity_elapsed() < 2000) hdr_flags |= SLAVE_HDR_WAKE_ACTIVE;
 
-            slave_sync_packet_t pkt;
-            pkt.hdr.lights_disabled = lights_disabled;
-            pkt.hdr.top_layer       = top_layer;
-            pkt.hdr.mods            = mods;
-            pkt.hdr.caps_lock       = caps;
+                slave_sync_packet_t pkt;
+                pkt.hdr.flags     = hdr_flags;
+                pkt.hdr.top_layer = top_layer;
+                pkt.hdr.mods      = mods;
+                pkt.hdr.reserved  = 0;
 
-            bool slave_is_left = !is_keyboard_left();
-            populate_half_keys(slave_is_left, active_mask, top_layer, pkt.keys, &pkt.enc_ccw, &pkt.enc_cw);
+                bool slave_is_left = !is_keyboard_left();
+                populate_half_keys(slave_is_left, active_mask, top_layer, pkt.keys, &pkt.enc_ccw, &pkt.enc_cw);
 
-            bool keys_changed = (memcmp(pkt.keys, last_sent_keys, sizeof(pkt.keys)) != 0) || (pkt.enc_ccw != last_sent_ccw) || (pkt.enc_cw != last_sent_cw);
-            periodic_full_sync_count++;
+                bool keys_changed = (memcmp(pkt.keys, last_sent_keys, sizeof(pkt.keys)) != 0) || (pkt.enc_ccw != last_sent_ccw) || (pkt.enc_cw != last_sent_cw);
+                periodic_full_sync_count++;
 
-            if (keys_changed || periodic_full_sync_count >= 12) {
-                if (transaction_rpc_exec(USR_BTN_SYNC, sizeof(pkt), &pkt, sizeof(slave_btn), &slave_btn)) {
-                    memcpy(last_sent_keys, pkt.keys, sizeof(last_sent_keys));
-                    last_sent_ccw            = pkt.enc_ccw;
-                    last_sent_cw             = pkt.enc_cw;
-                    periodic_full_sync_count = 0;
+                if (keys_changed || periodic_full_sync_count >= 12) {
+                    if (transaction_rpc_exec(USR_BTN_SYNC, sizeof(pkt), &pkt, sizeof(slave_btn), &slave_btn)) {
+                        memcpy(last_sent_keys, pkt.keys, sizeof(last_sent_keys));
+                        last_sent_ccw            = pkt.enc_ccw;
+                        last_sent_cw             = pkt.enc_cw;
+                        periodic_full_sync_count = 0;
+                    }
+                } else {
+                    transaction_rpc_exec(USR_BTN_SYNC, sizeof(pkt.hdr), &pkt.hdr, sizeof(slave_btn), &slave_btn);
                 }
-            } else {
-                transaction_rpc_exec(USR_BTN_SYNC, sizeof(pkt.hdr), &pkt.hdr, sizeof(slave_btn), &slave_btn);
-            }
 
-            // Non-master button: cycle RGB Matrix profile
-            if (slave_btn && !last_slave_btn) {
-                rgb_matrix_step();
+                // Non-master button over TRRS: cycle RGB Matrix profile
+                if (slave_btn && !last_slave_btn) {
+                    rgb_matrix_step();
+                }
+                last_slave_btn = slave_btn;
+            } else {
+                sync_local_state_if_needed();
             }
-            last_slave_btn = slave_btn;
         }
     } else {
-        // Caps Lock indicator on non-master half
-        bool caps = slave_has_hdr ? slave_hdr_state.caps_lock : host_keyboard_led_state().caps_lock;
+        // Caps Lock indicator on non-master half over TRRS
+        bool caps = slave_has_hdr ? ((slave_hdr_state.flags & SLAVE_HDR_CAPS_LOCK) != 0) : host_keyboard_led_state().caps_lock;
         gpio_write_pin(USR_LED_PIN, caps);
     }
 
@@ -446,6 +905,7 @@ static void get_glyph3x7(char c, uint8_t out[3]) {
         case '>': out[0] = 0x22; out[1] = 0x1C; out[2] = 0x08; break;
         case '^': out[0] = 0x02; out[1] = 0x01; out[2] = 0x02; break;
         case '~': out[0] = 0x08; out[1] = 0x04; out[2] = 0x08; break;
+        case '/': out[0] = 0x60; out[1] = 0x1C; out[2] = 0x03; break;
         default:  out[0] = 0x02; out[1] = 0x59; out[2] = 0x06; break;
     }
 }
@@ -957,7 +1417,7 @@ static void fb_draw_cell(uint8_t *fb, uint8_t cx, uint8_t cy, const char label[4
     }
 }
 
-static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, uint8_t mods, bool caps, const uint8_t pressed_rows[5], const uint16_t keys[5][6], uint16_t enc_ccw, uint16_t enc_cw) {
+static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, oled_conn_mode_t conn_mode, uint8_t mods, bool caps, const uint8_t pressed_rows[5], const uint16_t keys[5][6], uint16_t enc_ccw, uint16_t enc_cw) {
     memset(fb, 0, OLED_MATRIX_SIZE);
 
     bool shift = (mods & MOD_MASK_SHIFT) != 0;
@@ -965,16 +1425,27 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, uin
     bool alt   = (mods & MOD_MASK_ALT) != 0;
     bool gui   = (mods & MOD_MASK_GUI) != 0;
 
-    static const char PROGMEM layer_names[4][7] = {
-        "0:QWRT",
-        "1:LOWR",
-        "2:RAIS",
-        "3:ADJS",
+    static const char PROGMEM conn_names[4][5] = {
+        "TRRS",
+        "SYNC",
+        "WAIT",
+        "N/C",
     };
-    const char *lname = (top_layer < 4) ? layer_names[top_layer] : "?:LAYR";
-    uint8_t     hx    = 0;
+    const char *cname = (conn_mode <= OLED_CONN_DISC) ? conn_names[conn_mode] : "N/C";
+    char        hdr[7];
+    hdr[0]       = (top_layer < 10) ? (char)('0' + top_layer) : '?';
+    hdr[1]       = ':';
+    uint8_t hlen = 2;
+    for (uint8_t i = 0; i < 4; i++) {
+        char ch = (conn_mode <= OLED_CONN_DISC) ? (char)pgm_read_byte(&cname[i]) : cname[i];
+        if (ch == '\0') break;
+        hdr[hlen++] = ch;
+    }
+    hdr[hlen] = '\0';
+
+    uint8_t hx = 0;
     for (uint8_t i = 0; i < 6; i++) {
-        char ch = (top_layer < 4) ? (char)pgm_read_byte(&lname[i]) : lname[i];
+        char ch = hdr[i];
         if (ch == '\0') break;
         if (ch == ':') {
             uint8_t colon = 0x14;
@@ -1069,15 +1540,16 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, uin
 }
 
 typedef struct {
-    bool     valid;
-    bool     is_left;
-    uint8_t  top_layer;
-    uint8_t  mods;
-    bool     caps;
-    uint8_t  pressed_rows[5];
-    uint16_t keys[5][6];
-    uint16_t enc_ccw;
-    uint16_t enc_cw;
+    bool             valid;
+    bool             is_left;
+    uint8_t          top_layer;
+    oled_conn_mode_t conn_mode;
+    uint8_t          mods;
+    bool             caps;
+    uint8_t          pressed_rows[5];
+    uint16_t         keys[5][6];
+    uint16_t         enc_ccw;
+    uint16_t         enc_cw;
 } oled_render_cache_t;
 
 static oled_render_cache_t oled_cache                   = {0};
@@ -1089,14 +1561,15 @@ bool oled_task_user(void) {
         return false;
     }
 
-    bool     is_left = is_keyboard_left();
-    uint8_t  top_layer;
-    uint8_t  mods;
-    bool     caps;
-    uint8_t  pressed_rows[5];
-    uint16_t cur_keys[5][6];
-    uint16_t cur_ccw;
-    uint16_t cur_cw;
+    bool             is_left = is_keyboard_left();
+    uint8_t          top_layer;
+    oled_conn_mode_t conn_mode;
+    uint8_t          mods;
+    bool             caps;
+    uint8_t          pressed_rows[5];
+    uint16_t         cur_keys[5][6];
+    uint16_t         cur_ccw;
+    uint16_t         cur_cw;
 
     uint8_t row_offset = is_left ? 0 : 5;
     for (uint8_t r = 0; r < 5; r++) {
@@ -1105,29 +1578,40 @@ bool oled_task_user(void) {
 
     if (!is_keyboard_master() && slave_has_hdr && slave_has_keys) {
         top_layer = slave_hdr_state.top_layer;
+        conn_mode = OLED_CONN_TRRS;
         mods      = slave_hdr_state.mods;
-        caps      = slave_hdr_state.caps_lock;
+        caps      = (slave_hdr_state.flags & SLAVE_HDR_CAPS_LOCK) != 0;
         memcpy(cur_keys, slave_keys, sizeof(cur_keys));
         cur_ccw = slave_enc_ccw;
         cur_cw  = slave_enc_cw;
     } else {
         layer_state_t active_mask = layer_state | default_layer_state;
         top_layer                 = get_highest_layer(active_mask);
-        mods                      = get_mods() | get_weak_mods();
-#    ifndef NO_ACTION_ONESHOT
-        mods |= get_oneshot_mods();
-#    endif
+        mods                      = get_local_mods();
+        if (is_transport_connected() || !is_keyboard_master()) {
+            conn_mode = OLED_CONN_TRRS;
+        } else {
+            mods |= remote_mods;
+            if (host_service_connected && host_peer_connected) {
+                conn_mode = OLED_CONN_SYNC;
+            } else if (host_service_connected) {
+                conn_mode = OLED_CONN_WAIT;
+            } else {
+                conn_mode = OLED_CONN_DISC;
+            }
+        }
         caps = host_keyboard_led_state().caps_lock;
         populate_half_keys(is_left, active_mask, top_layer, cur_keys, &cur_ccw, &cur_cw);
     }
 
-    bool changed = !oled_cache.valid || (oled_cache.is_left != is_left) || (oled_cache.top_layer != top_layer) || (oled_cache.mods != mods) || (oled_cache.caps != caps) || (oled_cache.enc_ccw != cur_ccw) || (oled_cache.enc_cw != cur_cw) || (memcmp(oled_cache.pressed_rows, pressed_rows, sizeof(pressed_rows)) != 0) || (memcmp(oled_cache.keys, cur_keys, sizeof(cur_keys)) != 0);
+    bool changed = !oled_cache.valid || (oled_cache.is_left != is_left) || (oled_cache.top_layer != top_layer) || (oled_cache.conn_mode != conn_mode) || (oled_cache.mods != mods) || (oled_cache.caps != caps) || (oled_cache.enc_ccw != cur_ccw) || (oled_cache.enc_cw != cur_cw) || (memcmp(oled_cache.pressed_rows, pressed_rows, sizeof(pressed_rows)) != 0) || (memcmp(oled_cache.keys, cur_keys, sizeof(cur_keys)) != 0);
 
     if (changed) {
-        render_oled_layout(oled_frame, is_left, top_layer, mods, caps, pressed_rows, cur_keys, cur_ccw, cur_cw);
+        render_oled_layout(oled_frame, is_left, top_layer, conn_mode, mods, caps, pressed_rows, cur_keys, cur_ccw, cur_cw);
         oled_cache.valid     = true;
         oled_cache.is_left   = is_left;
         oled_cache.top_layer = top_layer;
+        oled_cache.conn_mode = conn_mode;
         oled_cache.mods      = mods;
         oled_cache.caps      = caps;
         memcpy(oled_cache.pressed_rows, pressed_rows, sizeof(oled_cache.pressed_rows));
