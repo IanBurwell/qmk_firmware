@@ -71,18 +71,24 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][NUM_DIRECTIONS] = {
     [_QWERTY] = {ENCODER_CCW_CW(MS_WHLU, MS_WHLD), ENCODER_CCW_CW(KC_VOLU, KC_VOLD)},
     [_LOWER]  = {ENCODER_CCW_CW(RM_VALD, RM_VALU), ENCODER_CCW_CW(RM_HUED, RM_HUEU)},
     [_RAISE]  = {ENCODER_CCW_CW(RM_SPDD, RM_SPDU), ENCODER_CCW_CW(RM_PREV, RM_NEXT)},
-    [_ADJUST] = {ENCODER_CCW_CW(_______, _______), ENCODER_CCW_CW(_______, _______)},
+    [_ADJUST] = {ENCODER_CCW_CW(RM_VALD, RM_VALU), ENCODER_CCW_CW(RM_HUEU, RM_HUED)},
 };
 
 #define SLAVE_HDR_LIGHTS_OFF  0x01
 #define SLAVE_HDR_CAPS_LOCK   0x02
 #define SLAVE_HDR_WAKE_ACTIVE 0x04
 
+typedef enum {
+    OLED_APP_KEYMAP = 0, // Default: dynamic keymap & encoder layout
+    OLED_APP_RGB_INFO,   // RGB Matrix settings (Left) & controls guide (Right)
+    OLED_APP_COUNT,
+} oled_app_t;
+
 typedef struct {
     uint8_t flags;
     uint8_t top_layer;
     uint8_t mods;
-    uint8_t reserved;
+    uint8_t oled_app;
 } slave_sync_hdr_t;
 
 typedef struct {
@@ -90,17 +96,22 @@ typedef struct {
     uint16_t         keys[5][6];
     uint16_t         enc_ccw;
     uint16_t         enc_cw;
+    uint16_t         peer_enc_ccw;
+    uint16_t         peer_enc_cw;
 } slave_sync_packet_t;
 
 _Static_assert(sizeof(slave_sync_packet_t) <= RPC_M2S_BUFFER_SIZE, "slave_sync_packet_t exceeds RPC_M2S_BUFFER_SIZE");
 
-static bool             lights_disabled  = false;
-static slave_sync_hdr_t slave_hdr_state  = {0, 0, 0, 0};
-static uint16_t         slave_keys[5][6] = {{0}};
-static uint16_t         slave_enc_ccw    = KC_NO;
-static uint16_t         slave_enc_cw     = KC_NO;
-static bool             slave_has_hdr    = false;
-static bool             slave_has_keys   = false;
+static bool             lights_disabled    = false;
+static oled_app_t       current_oled_app   = OLED_APP_KEYMAP;
+static slave_sync_hdr_t slave_hdr_state    = {0, 0, 0, 0};
+static uint16_t         slave_keys[5][6]   = {{0}};
+static uint16_t         slave_enc_ccw      = KC_NO;
+static uint16_t         slave_enc_cw       = KC_NO;
+static uint16_t         slave_peer_enc_ccw = KC_NO;
+static uint16_t         slave_peer_enc_cw  = KC_NO;
+static bool             slave_has_hdr      = false;
+static bool             slave_has_keys     = false;
 
 static uint16_t resolve_active_keycode(layer_state_t active_mask, uint8_t top_layer, uint8_t row, uint8_t col) {
     uint8_t max_layers = keymap_layer_count();
@@ -149,6 +160,21 @@ static void populate_half_keys(bool is_left, layer_state_t active_mask, uint8_t 
     *out_cw         = resolve_active_encoder(active_mask, top_layer, enc_idx, is_left);
 }
 
+static void populate_rgb_right_panel(uint16_t out_keys[5][6], uint16_t *out_r_ccw, uint16_t *out_r_cw, uint16_t *out_l_ccw, uint16_t *out_l_cw) {
+    layer_state_t adj_mask = ((layer_state_t)1 << _ADJUST) | ((layer_state_t)1 << _QWERTY);
+    for (uint8_t r = 0; r < 5; r++) {
+        for (uint8_t c = 0; c < 6; c++) {
+            out_keys[r][c] = keycode_at_keymap_location(_ADJUST, (uint8_t)(r + 5), c);
+        }
+    }
+    // Left encoder (idx 0): normal polarity (CCW = false, CW = true)
+    *out_l_ccw = resolve_active_encoder(adj_mask, _ADJUST, 0, false);
+    *out_l_cw  = resolve_active_encoder(adj_mask, _ADJUST, 0, true);
+    // Right encoder (idx 1): Right half PCB is flipped (physical CCW = true, physical CW = false)
+    *out_r_ccw = resolve_active_encoder(adj_mask, _ADJUST, 1, true);
+    *out_r_cw  = resolve_active_encoder(adj_mask, _ADJUST, 1, false);
+}
+
 #if defined(VIA_ENABLE) && (VIA_EEPROM_CUSTOM_CONFIG_SIZE >= 4)
 static uint32_t compute_flash_keymap_hash(void) {
     uint32_t hash   = 2166136261UL;
@@ -187,12 +213,34 @@ static void wake_local_displays_and_rgb(void) {
 #endif
 }
 
+static void set_oled_app(oled_app_t new_app);
+
+static void cycle_oled_app(void) {
+    set_oled_app((oled_app_t)((current_oled_app + 1) % OLED_APP_COUNT));
+}
+
+static void toggle_lights_disabled(void) {
+    lights_disabled = !lights_disabled;
+    if (lights_disabled) {
+#ifdef RGB_MATRIX_ENABLE
+        rgb_matrix_disable_noeeprom();
+#endif
+        oled_off();
+    } else {
+#ifdef RGB_MATRIX_ENABLE
+        rgb_matrix_enable_noeeprom();
+#endif
+        wake_local_displays_and_rgb();
+    }
+}
+
 static void usr_btn_sync_slave_handler(uint8_t in_buflen, const void *in_data, uint8_t out_buflen, void *out_data) {
     if (in_buflen >= sizeof(slave_sync_hdr_t)) {
         slave_sync_hdr_t hdr;
         memcpy(&hdr, in_data, sizeof(hdr));
         bool prev_disabled = lights_disabled;
         lights_disabled    = (hdr.flags & SLAVE_HDR_LIGHTS_OFF) != 0;
+        set_oled_app((hdr.oled_app < OLED_APP_COUNT) ? (oled_app_t)hdr.oled_app : OLED_APP_KEYMAP);
         slave_hdr_state    = hdr;
         slave_has_hdr      = true;
         if (!lights_disabled && (prev_disabled || (hdr.flags & SLAVE_HDR_WAKE_ACTIVE) != 0)) {
@@ -203,9 +251,11 @@ static void usr_btn_sync_slave_handler(uint8_t in_buflen, const void *in_data, u
         slave_sync_packet_t pkt;
         memcpy(&pkt, in_data, sizeof(pkt));
         memcpy(slave_keys, pkt.keys, sizeof(slave_keys));
-        slave_enc_ccw  = pkt.enc_ccw;
-        slave_enc_cw   = pkt.enc_cw;
-        slave_has_keys = true;
+        slave_enc_ccw      = pkt.enc_ccw;
+        slave_enc_cw       = pkt.enc_cw;
+        slave_peer_enc_ccw = pkt.peer_enc_ccw;
+        slave_peer_enc_cw  = pkt.peer_enc_cw;
+        slave_has_keys     = true;
     }
     if (out_buflen >= sizeof(bool)) {
         bool btn = !gpio_read_pin(USR_BTN_PIN);
@@ -231,6 +281,206 @@ typedef struct {
     uint8_t speed;
 } rgb_sync_snapshot_t;
 
+#ifdef RGB_MATRIX_ENABLE
+#    define RGB_PRESET_SLOTS         32
+#    define RGB_PRESET_MAGIC         0x52503031UL
+#    define RGB_PRESET_SAVE_DELAY_MS 1500
+
+typedef struct {
+    uint8_t h;
+    uint8_t s;
+    uint8_t v;
+    uint8_t speed;
+} rgb_mode_preset_t;
+
+typedef struct {
+    uint32_t          magic;
+    uint32_t          valid_mask;
+    rgb_mode_preset_t slots[RGB_PRESET_SLOTS];
+} rgb_mode_presets_store_t;
+
+_Static_assert(sizeof(rgb_mode_presets_store_t) == EECONFIG_USER_DATA_SIZE, "rgb_mode_presets_store_t must match EECONFIG_USER_DATA_SIZE");
+
+static rgb_mode_presets_store_t rgb_presets             = {0};
+static bool                     rgb_presets_loaded      = false;
+static bool                     rgb_presets_dirty       = false;
+static uint32_t                 rgb_presets_dirty_since = 0;
+static uint8_t                  tracked_rgb_mode        = 0;
+static uint8_t                  tracked_rgb_h           = 0;
+static uint8_t                  tracked_rgb_s           = 0;
+static uint8_t                  tracked_rgb_v           = 0;
+static uint8_t                  tracked_rgb_speed       = 0;
+
+static uint8_t rgb_clamp_val(uint8_t v) {
+#    ifdef RGB_MATRIX_MAXIMUM_BRIGHTNESS
+    return (v > RGB_MATRIX_MAXIMUM_BRIGHTNESS) ? RGB_MATRIX_MAXIMUM_BRIGHTNESS : v;
+#    else
+    return v;
+#    endif
+}
+
+static rgb_mode_preset_t rgb_preset_default_for_mode(uint8_t mode) {
+    uint8_t max_v = rgb_clamp_val(RGB_MATRIX_DEFAULT_VAL);
+    switch (mode) {
+        case RGB_MATRIX_SOLID_COLOR:
+            return (rgb_mode_preset_t){RGB_MATRIX_DEFAULT_HUE, RGB_MATRIX_DEFAULT_SAT, max_v, 128};
+#    ifdef ENABLE_RGB_MATRIX_GRADIENT_UP_DOWN_VAL
+        case RGB_MATRIX_GRADIENT_UP_DOWN_VAL:
+            return (rgb_mode_preset_t){RGB_MATRIX_DEFAULT_HUE, RGB_MATRIX_DEFAULT_SAT, max_v, 128};
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_GRADIENT_UP_DOWN
+        case RGB_MATRIX_GRADIENT_UP_DOWN:
+            return (rgb_mode_preset_t){148, 255, max_v, 128};
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_RAINBOW_MOVING_CHEVRON
+        case RGB_MATRIX_RAINBOW_MOVING_CHEVRON:
+            return (rgb_mode_preset_t){0, 255, max_v, 128};
+#    endif
+        default:
+            return (rgb_mode_preset_t){RGB_MATRIX_DEFAULT_HUE, 255, max_v, 128};
+    }
+}
+
+static rgb_mode_preset_t rgb_presets_get(uint8_t mode) {
+    if (mode >= 1 && mode <= RGB_PRESET_SLOTS) {
+        uint32_t bit = (1UL << (mode - 1));
+        if ((rgb_presets.valid_mask & bit) != 0) {
+            rgb_mode_preset_t p = rgb_presets.slots[mode - 1];
+            p.v                 = rgb_clamp_val(p.v);
+            return p;
+        }
+    }
+    return rgb_preset_default_for_mode(mode);
+}
+
+static void rgb_presets_store_slot(uint8_t mode, uint8_t h, uint8_t s, uint8_t v, uint8_t speed, bool mark_dirty) {
+    if (mode < 1 || mode > RGB_PRESET_SLOTS) {
+        return;
+    }
+    v             = rgb_clamp_val(v);
+    uint8_t  idx  = (uint8_t)(mode - 1);
+    uint32_t bit  = (1UL << idx);
+    bool     diff = ((rgb_presets.valid_mask & bit) == 0) || (rgb_presets.slots[idx].h != h) || (rgb_presets.slots[idx].s != s) || (rgb_presets.slots[idx].v != v) || (rgb_presets.slots[idx].speed != speed);
+    if (!diff) {
+        return;
+    }
+    rgb_presets.slots[idx].h     = h;
+    rgb_presets.slots[idx].s     = s;
+    rgb_presets.slots[idx].v     = v;
+    rgb_presets.slots[idx].speed = speed;
+    rgb_presets.valid_mask |= bit;
+    if (mark_dirty) {
+        rgb_presets_dirty       = true;
+        rgb_presets_dirty_since = timer_read32();
+    }
+}
+
+static void rgb_presets_flush_if_dirty(bool force) {
+    if (!rgb_presets_dirty || !is_keyboard_master()) {
+        return;
+    }
+    if (force || timer_elapsed32(rgb_presets_dirty_since) >= RGB_PRESET_SAVE_DELAY_MS) {
+        eeconfig_update_user_datablock(&rgb_presets, 0, sizeof(rgb_presets));
+        rgb_presets_dirty = false;
+    }
+}
+
+static void rgb_presets_init_defaults(bool write_eeprom) {
+    memset(&rgb_presets, 0, sizeof(rgb_presets));
+    rgb_presets.magic  = RGB_PRESET_MAGIC;
+    uint8_t max_modes  = (RGB_MATRIX_EFFECT_MAX > 1) ? (uint8_t)(RGB_MATRIX_EFFECT_MAX - 1) : 1;
+    if (max_modes > RGB_PRESET_SLOTS) {
+        max_modes = RGB_PRESET_SLOTS;
+    }
+    for (uint8_t m = 1; m <= max_modes; m++) {
+        rgb_presets.slots[m - 1] = rgb_preset_default_for_mode(m);
+        rgb_presets.valid_mask |= (1UL << (m - 1));
+    }
+    if (write_eeprom) {
+        eeconfig_update_user_datablock(&rgb_presets, 0, sizeof(rgb_presets));
+        rgb_presets_dirty = false;
+    }
+}
+
+static void rgb_presets_load_or_init(void) {
+    if (!is_keyboard_master()) {
+        return;
+    }
+    bool valid = eeconfig_is_user_datablock_valid();
+    if (valid) {
+        eeconfig_read_user_datablock(&rgb_presets, 0, sizeof(rgb_presets));
+        if (rgb_presets.magic != RGB_PRESET_MAGIC) {
+            valid = false;
+        }
+    }
+    uint8_t cur_mode  = rgb_matrix_get_mode();
+    hsv_t   cur_hsv   = rgb_matrix_get_hsv();
+    uint8_t cur_v     = rgb_clamp_val(cur_hsv.v);
+    uint8_t cur_speed = rgb_matrix_get_speed();
+
+    if (!valid) {
+        rgb_presets_init_defaults(false);
+        // Preserve the keyboard's active mode color on first upgrade to per-mode storage
+        rgb_presets_store_slot(cur_mode, cur_hsv.h, cur_hsv.s, cur_v, cur_speed, false);
+        eeconfig_update_user_datablock(&rgb_presets, 0, sizeof(rgb_presets));
+    } else {
+        rgb_presets_store_slot(cur_mode, cur_hsv.h, cur_hsv.s, cur_v, cur_speed, false);
+    }
+
+    rgb_presets_dirty  = false;
+    tracked_rgb_mode   = cur_mode;
+    tracked_rgb_h      = cur_hsv.h;
+    tracked_rgb_s      = cur_hsv.s;
+    tracked_rgb_v      = cur_v;
+    tracked_rgb_speed  = cur_speed;
+    rgb_presets_loaded = true;
+}
+
+static void rgb_presets_record_synced_state(uint8_t mode, uint8_t h, uint8_t s, uint8_t v, uint8_t speed) {
+    v                 = rgb_clamp_val(v);
+    tracked_rgb_mode  = mode;
+    tracked_rgb_h     = h;
+    tracked_rgb_s     = s;
+    tracked_rgb_v     = v;
+    tracked_rgb_speed = speed;
+    rgb_presets_store_slot(mode, h, s, v, speed, true);
+}
+
+static void rgb_presets_track_and_apply_local(void) {
+    if (!is_keyboard_master() || !rgb_presets_loaded || lights_disabled || !rgb_matrix_is_enabled()) {
+        return;
+    }
+    uint8_t cur_mode  = rgb_matrix_get_mode();
+    hsv_t   cur_hsv   = rgb_matrix_get_hsv();
+    uint8_t cur_speed = rgb_matrix_get_speed();
+
+    if (cur_mode != tracked_rgb_mode) {
+        rgb_mode_preset_t p = rgb_presets_get(cur_mode);
+        rgb_matrix_sethsv(p.h, p.s, p.v);
+        rgb_matrix_set_speed(p.speed);
+        hsv_t applied      = rgb_matrix_get_hsv();
+        uint8_t applied_sp = rgb_matrix_get_speed();
+        tracked_rgb_mode   = cur_mode;
+        tracked_rgb_h      = applied.h;
+        tracked_rgb_s      = applied.s;
+        tracked_rgb_v      = applied.v;
+        tracked_rgb_speed  = applied_sp;
+        rgb_presets_store_slot(cur_mode, applied.h, applied.s, applied.v, applied_sp, false);
+    } else if (cur_hsv.h != tracked_rgb_h || cur_hsv.s != tracked_rgb_s || cur_hsv.v != tracked_rgb_v || cur_speed != tracked_rgb_speed) {
+        tracked_rgb_h     = cur_hsv.h;
+        tracked_rgb_s     = cur_hsv.s;
+        tracked_rgb_v     = cur_hsv.v;
+        tracked_rgb_speed = cur_speed;
+        rgb_presets_store_slot(cur_mode, cur_hsv.h, cur_hsv.s, cur_hsv.v, cur_speed, true);
+    }
+}
+#else
+static inline void rgb_presets_flush_if_dirty(bool force) { (void)force; }
+static inline void rgb_presets_init_defaults(bool write_eeprom) { (void)write_eeprom; }
+static inline void rgb_presets_load_or_init(void) {}
+static inline void rgb_presets_track_and_apply_local(void) {}
+#endif
+
 #define RAW_SYNC_CMD_ID           0xF0
 #define RAW_SYNC_MAGIC_0          0x53 // 'S'
 #define RAW_SYNC_MAGIC_1          0x50 // 'P'
@@ -249,6 +499,7 @@ typedef struct {
 #define HALF_FLAG_SYNC_TIMER    0x10
 #define HALF_FLAG_PING_REPLY    0x20
 #define HALF_FLAG_ACTIVITY_WAKE 0x40
+#define HALF_FLAG_APP_CHANGED   0x80
 
 static bool                host_service_connected   = false;
 static bool                host_peer_connected      = false;
@@ -299,31 +550,61 @@ static void snapshot_current_rgb(rgb_sync_snapshot_t *out) {
 static void apply_combined_tri_layers(void) {
     bool want_lower = local_lower_held || remote_lower_held;
     bool want_upper = local_upper_held || remote_upper_held;
-    bool changed    = false;
 
     if (want_lower && !layer_state_is(_LOWER)) {
         layer_on(_LOWER);
-        changed = true;
     } else if (!want_lower && layer_state_is(_LOWER)) {
         layer_off(_LOWER);
-        changed = true;
     }
 
     if (want_upper && !layer_state_is(_RAISE)) {
         layer_on(_RAISE);
-        changed = true;
     } else if (!want_upper && layer_state_is(_RAISE)) {
         layer_off(_RAISE);
-        changed = true;
     }
 
-    bool want_adjust = want_lower && want_upper;
-    if (changed || (layer_state_is(_ADJUST) != want_adjust)) {
-        update_tri_layer(_LOWER, _RAISE, _ADJUST);
+    bool want_adjust = (want_lower && want_upper) || (current_oled_app == OLED_APP_RGB_INFO);
+    if (want_adjust && !layer_state_is(_ADJUST)) {
+        layer_on(_ADJUST);
+    } else if (!want_adjust && layer_state_is(_ADJUST)) {
+        layer_off(_ADJUST);
     }
 }
 
-static void host_sync_send_state(bool rgb_changed, bool sync_rgb_timer, bool is_reply, bool activity_wake) {
+static void sync_app_layer_override(void) {
+    if (!is_keyboard_master()) {
+        return;
+    }
+    if (current_oled_app == OLED_APP_RGB_INFO) {
+        if (!layer_state_is(_ADJUST)) {
+            layer_on(_ADJUST);
+        }
+    } else {
+        if (!is_transport_connected()) {
+            apply_combined_tri_layers();
+        } else {
+            update_tri_layer(_LOWER, _RAISE, _ADJUST);
+        }
+    }
+}
+
+static void set_oled_app(oled_app_t new_app) {
+    oled_app_t clamped = (new_app < OLED_APP_COUNT) ? new_app : OLED_APP_KEYMAP;
+    if (current_oled_app == clamped) {
+        return;
+    }
+    current_oled_app = clamped;
+    sync_app_layer_override();
+}
+
+layer_state_t layer_state_set_user(layer_state_t state) {
+    if (is_keyboard_master() && current_oled_app == OLED_APP_RGB_INFO) {
+        state |= ((layer_state_t)1 << _ADJUST);
+    }
+    return state;
+}
+
+static void host_sync_send_state(bool rgb_changed, bool sync_rgb_timer, bool is_reply, bool activity_wake, bool app_changed) {
 #ifdef RAW_ENABLE
     if (!is_keyboard_master() || is_transport_connected() || !host_service_connected) {
         return;
@@ -353,6 +634,9 @@ static void host_sync_send_state(bool rgb_changed, bool sync_rgb_timer, bool is_
         last_activity_sync_tx    = timer_read32();
         last_activity_sync_valid = true;
     }
+    if (app_changed) {
+        flags |= HALF_FLAG_APP_CHANGED;
+    }
 
     local_state_seq++;
 
@@ -371,6 +655,7 @@ static void host_sync_send_state(bool rgb_changed, bool sync_rgb_timer, bool is_
     pkt[12] = cur_rgb.speed;
     pkt[13] = local_rgb_seq;
     pkt[14] = local_state_seq;
+    pkt[15] = (uint8_t)current_oled_app;
 
     raw_hid_send(pkt, sizeof(pkt));
 #else
@@ -378,17 +663,23 @@ static void host_sync_send_state(bool rgb_changed, bool sync_rgb_timer, bool is_
     (void)sync_rgb_timer;
     (void)is_reply;
     (void)activity_wake;
+    (void)app_changed;
 #endif
 }
 
 static void clear_host_sync_state(void) {
-    bool had_remote = host_service_connected || host_peer_connected || remote_lower_held || remote_upper_held || (remote_mods != 0);
+    bool was_host_paired  = host_peer_connected;
+    bool had_app_override = !is_transport_connected() && was_host_paired && is_keyboard_left() && (current_oled_app != OLED_APP_KEYMAP);
+    bool had_remote       = host_service_connected || host_peer_connected || remote_lower_held || remote_upper_held || (remote_mods != 0) || had_app_override;
     host_service_connected   = false;
     host_peer_connected      = false;
     last_activity_sync_valid = false;
     remote_lower_held        = false;
     remote_upper_held        = false;
     remote_mods              = 0;
+    if (had_app_override) {
+        current_oled_app = OLED_APP_KEYMAP;
+    }
     if (had_remote) {
         apply_combined_tri_layers();
     }
@@ -462,6 +753,9 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
             remote_lower_held = false;
             remote_upper_held = false;
             remote_mods       = 0;
+            if (is_keyboard_left()) {
+                current_oled_app = OLED_APP_KEYMAP;
+            }
             apply_combined_tri_layers();
         }
         host_peer_connected = new_peer;
@@ -470,7 +764,7 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
             bool auth_rgb = (data[6] != 0);
             last_sent_mods = get_local_mods();
             snapshot_current_rgb(&last_rgb_snapshot);
-            host_sync_send_state(auth_rgb, auth_rgb, true, false);
+            host_sync_send_state(auth_rgb, auth_rgb, true, false, auth_rgb);
         }
         return true;
     }
@@ -490,6 +784,10 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
         remote_upper_held = (flags & HALF_FLAG_UPPER_HELD) != 0;
         remote_mods       = data[6];
         apply_combined_tri_layers();
+
+        if ((flags & HALF_FLAG_APP_CHANGED) != 0 && length >= 16) {
+            set_oled_app((data[15] < OLED_APP_COUNT) ? (oled_app_t)data[15] : OLED_APP_KEYMAP);
+        }
 
         if ((flags & HALF_FLAG_RGB_CHANGED) != 0) {
             bool prev_lights_disabled = lights_disabled;
@@ -536,6 +834,8 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
                     if ((flags & HALF_FLAG_SYNC_TIMER) != 0) {
                         g_rgb_timer = 0;
                     }
+                    hsv_t synced_hsv = rgb_matrix_get_hsv();
+                    rgb_presets_record_synced_state(rgb_matrix_get_mode(), synced_hsv.h, synced_hsv.s, synced_hsv.v, rgb_matrix_get_speed());
                 } else if (rgb_matrix_is_enabled()) {
                     rgb_matrix_disable();
                 }
@@ -569,7 +869,7 @@ static void sync_local_state_if_needed(void) {
     if (mods_changed || rgb_changed) {
         last_sent_mods    = cur_mods;
         last_rgb_snapshot = cur_rgb;
-        host_sync_send_state(rgb_changed, mode_changed, false, true);
+        host_sync_send_state(rgb_changed, mode_changed, false, true, false);
     }
 }
 
@@ -579,20 +879,20 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             local_lower_held = record->event.pressed;
             apply_combined_tri_layers();
             last_sent_mods = get_local_mods();
-            host_sync_send_state(false, false, false, record->event.pressed);
+            host_sync_send_state(false, false, false, record->event.pressed, false);
             return false;
         }
         if (keycode == QK_TRI_LAYER_UPPER) {
             local_upper_held = record->event.pressed;
             apply_combined_tri_layers();
             last_sent_mods = get_local_mods();
-            host_sync_send_state(false, false, false, record->event.pressed);
+            host_sync_send_state(false, false, false, record->event.pressed, false);
             return false;
         }
         if (record->event.pressed && host_service_connected && host_peer_connected) {
             if (!last_activity_sync_valid || timer_elapsed32(last_activity_sync_tx) >= ACTIVITY_WAKE_THROTTLE_MS) {
                 last_sent_mods = get_local_mods();
-                host_sync_send_state(false, false, false, true);
+                host_sync_send_state(false, false, false, true, false);
             }
         }
     }
@@ -602,6 +902,7 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
 void post_process_record_user(uint16_t keycode, keyrecord_t *record) {
     (void)keycode;
     (void)record;
+    rgb_presets_track_and_apply_local();
     sync_local_state_if_needed();
 }
 
@@ -615,6 +916,7 @@ void keyboard_post_init_user(void) {
         if (!rgb_matrix_config.mode || rgb_matrix_config.mode >= RGB_MATRIX_EFFECT_MAX || rgb_matrix_config.flags == 0) {
             eeconfig_update_rgb_matrix_default();
         }
+        rgb_presets_load_or_init();
     }
 #endif
 
@@ -634,10 +936,29 @@ void keyboard_post_init_user(void) {
     last_sent_mods = get_local_mods();
 }
 
+void eeconfig_init_user(void) {
+    rgb_presets_init_defaults(true);
+#ifdef RGB_MATRIX_ENABLE
+    rgb_mode_preset_t p = rgb_presets_get(RGB_MATRIX_DEFAULT_MODE);
+    tracked_rgb_mode    = RGB_MATRIX_DEFAULT_MODE;
+    tracked_rgb_h       = p.h;
+    tracked_rgb_s       = p.s;
+    tracked_rgb_v       = p.v;
+    tracked_rgb_speed   = p.speed;
+#endif
+}
+
+bool shutdown_user(bool jump_to_bootloader) {
+    (void)jump_to_bootloader;
+    rgb_presets_flush_if_dirty(true);
+    return true;
+}
+
 void housekeeping_task_user(void) {
     if (is_keyboard_master()) {
         if (bootloader_pending && timer_elapsed32(bootloader_req_time) >= RAW_BOOTLOADER_DELAY_MS) {
             bootloader_pending = false;
+            rgb_presets_flush_if_dirty(true);
             oled_off();
             reset_keyboard();
             return;
@@ -665,6 +986,8 @@ void housekeeping_task_user(void) {
         static uint16_t last_sent_keys[5][6]     = {{0}};
         static uint16_t last_sent_ccw            = 0xFFFF;
         static uint16_t last_sent_cw             = 0xFFFF;
+        static uint16_t last_sent_peer_ccw       = 0xFFFF;
+        static uint16_t last_sent_peer_cw        = 0xFFFF;
         static uint8_t  periodic_full_sync_count = 0;
 
         if (timer_elapsed(poll_timer) >= 20) {
@@ -673,24 +996,24 @@ void housekeeping_task_user(void) {
             bool master_btn = !gpio_read_pin(USR_BTN_PIN);
             bool slave_btn  = false;
 
-            // User button (GP24):
-            // - Left half (or TRRS master): toggle OLED & RGB lights
-            // - Right half (Dual-USB): cycle RGB Matrix profile (synced to Left if paired)
+            // Left GP24 button toggles OLED & RGB lights;
+            // Right GP24 button cycles OLED app/mode and wakes displays.
             if (master_btn && !last_master_btn) {
-                if (trrs_connected || is_keyboard_left()) {
-                    lights_disabled = !lights_disabled;
-                    if (lights_disabled) {
-                        rgb_matrix_disable_noeeprom();
-                        oled_off();
-                    } else {
-                        rgb_matrix_enable_noeeprom();
+                if (is_keyboard_left()) {
+                    toggle_lights_disabled();
+                } else {
+                    cycle_oled_app();
+                    if (!lights_disabled) {
                         wake_local_displays_and_rgb();
                     }
-                } else {
-                    rgb_matrix_step();
+                    if (!trrs_connected) {
+                        host_sync_send_state(false, false, false, !lights_disabled, true);
+                    }
                 }
             }
             last_master_btn = master_btn;
+
+            rgb_presets_track_and_apply_local();
 
             if (trrs_connected) {
                 layer_state_t active_mask = layer_state | default_layer_state;
@@ -706,12 +1029,18 @@ void housekeeping_task_user(void) {
                 pkt.hdr.flags     = hdr_flags;
                 pkt.hdr.top_layer = top_layer;
                 pkt.hdr.mods      = mods;
-                pkt.hdr.reserved  = 0;
+                pkt.hdr.oled_app  = (uint8_t)current_oled_app;
 
                 bool slave_is_left = !is_keyboard_left();
-                populate_half_keys(slave_is_left, active_mask, top_layer, pkt.keys, &pkt.enc_ccw, &pkt.enc_cw);
+                if (current_oled_app == OLED_APP_RGB_INFO && !slave_is_left) {
+                    populate_rgb_right_panel(pkt.keys, &pkt.enc_ccw, &pkt.enc_cw, &pkt.peer_enc_ccw, &pkt.peer_enc_cw);
+                } else {
+                    populate_half_keys(slave_is_left, active_mask, top_layer, pkt.keys, &pkt.enc_ccw, &pkt.enc_cw);
+                    pkt.peer_enc_ccw = KC_NO;
+                    pkt.peer_enc_cw  = KC_NO;
+                }
 
-                bool keys_changed = (memcmp(pkt.keys, last_sent_keys, sizeof(pkt.keys)) != 0) || (pkt.enc_ccw != last_sent_ccw) || (pkt.enc_cw != last_sent_cw);
+                bool keys_changed = (memcmp(pkt.keys, last_sent_keys, sizeof(pkt.keys)) != 0) || (pkt.enc_ccw != last_sent_ccw) || (pkt.enc_cw != last_sent_cw) || (pkt.peer_enc_ccw != last_sent_peer_ccw) || (pkt.peer_enc_cw != last_sent_peer_cw);
                 periodic_full_sync_count++;
 
                 if (keys_changed || periodic_full_sync_count >= 12) {
@@ -719,20 +1048,31 @@ void housekeeping_task_user(void) {
                         memcpy(last_sent_keys, pkt.keys, sizeof(last_sent_keys));
                         last_sent_ccw            = pkt.enc_ccw;
                         last_sent_cw             = pkt.enc_cw;
+                        last_sent_peer_ccw       = pkt.peer_enc_ccw;
+                        last_sent_peer_cw        = pkt.peer_enc_cw;
                         periodic_full_sync_count = 0;
                     }
                 } else {
                     transaction_rpc_exec(USR_BTN_SYNC, sizeof(pkt.hdr), &pkt.hdr, sizeof(slave_btn), &slave_btn);
                 }
 
-                // Non-master button over TRRS: cycle RGB Matrix profile
+                // Slave GP24 over TRRS: Left toggles OLED & RGB lights, Right cycles OLED app/mode.
                 if (slave_btn && !last_slave_btn) {
-                    rgb_matrix_step();
+                    if (slave_is_left) {
+                        toggle_lights_disabled();
+                    } else {
+                        cycle_oled_app();
+                        if (!lights_disabled) {
+                            wake_local_displays_and_rgb();
+                        }
+                    }
                 }
                 last_slave_btn = slave_btn;
             } else {
                 sync_local_state_if_needed();
             }
+
+            rgb_presets_flush_if_dirty(false);
         }
     } else {
         // Caps Lock indicator on non-master half over TRRS
@@ -906,6 +1246,10 @@ static void get_glyph3x7(char c, uint8_t out[3]) {
         case '^': out[0] = 0x02; out[1] = 0x01; out[2] = 0x02; break;
         case '~': out[0] = 0x08; out[1] = 0x04; out[2] = 0x08; break;
         case '/': out[0] = 0x60; out[1] = 0x1C; out[2] = 0x03; break;
+        case '%': out[0] = 0x61; out[1] = 0x1C; out[2] = 0x43; break;
+        case ':': out[0] = 0x00; out[1] = 0x14; out[2] = 0x00; break;
+        case '#': out[0] = 0x14; out[1] = 0x7F; out[2] = 0x14; break;
+        case ' ': out[0] = 0x00; out[1] = 0x00; out[2] = 0x00; break;
         default:  out[0] = 0x02; out[1] = 0x59; out[2] = 0x06; break;
     }
 }
@@ -1298,6 +1642,121 @@ static void fb_draw_cols7(uint8_t *fb, uint8_t x, uint8_t y, const uint8_t *cols
     }
 }
 
+static void fb_fill_rect(uint8_t *fb, uint8_t x, uint8_t y, uint8_t w, uint8_t h, bool on) {
+    for (uint8_t dy = 0; dy < h; dy++) {
+        for (uint8_t dx = 0; dx < w; dx++) {
+            fb_set_pixel(fb, (uint8_t)(x + dx), (uint8_t)(y + dy), on);
+        }
+    }
+}
+
+static void fb_draw_rect(uint8_t *fb, uint8_t x, uint8_t y, uint8_t w, uint8_t h) {
+    if (w == 0 || h == 0) return;
+    for (uint8_t dx = 0; dx < w; dx++) {
+        fb_set_pixel(fb, (uint8_t)(x + dx), y, true);
+        fb_set_pixel(fb, (uint8_t)(x + dx), (uint8_t)(y + h - 1), true);
+    }
+    for (uint8_t dy = 0; dy < h; dy++) {
+        fb_set_pixel(fb, x, (uint8_t)(y + dy), true);
+        fb_set_pixel(fb, (uint8_t)(x + w - 1), (uint8_t)(y + dy), true);
+    }
+}
+
+static void fb_draw_hline(uint8_t *fb, uint8_t x, uint8_t y, uint8_t w, bool dotted) {
+    uint8_t step = dotted ? 2 : 1;
+    for (uint8_t dx = 0; dx < w; dx = (uint8_t)(dx + step)) {
+        fb_set_pixel(fb, (uint8_t)(x + dx), y, true);
+    }
+}
+
+static uint8_t fb_measure_text3x7(const char *str) {
+    uint8_t w = 0;
+    uint8_t g4[4];
+    for (uint8_t i = 0; str[i] != '\0'; i++) {
+        char ch = str[i];
+        if (i > 0 && ch != ' ' && str[i - 1] != ' ') {
+            w = (uint8_t)(w + 1);
+        }
+        if (ch == ' ') {
+            w = (uint8_t)(w + 2);
+        } else if (ch == ':') {
+            w = (uint8_t)(w + 1);
+        } else {
+            if (ch >= 'a' && ch <= 'z') {
+                ch = (char)(ch - 'a' + 'A');
+            }
+            w = (uint8_t)(w + (get_glyph4x7_wide(ch, g4) ? 4 : 3));
+        }
+    }
+    return w;
+}
+
+static void fb_draw_text3x7(uint8_t *fb, uint8_t x, uint8_t y, const char *str, bool invert) {
+    uint8_t cx = x;
+    for (uint8_t i = 0; str[i] != '\0'; i++) {
+        char ch = str[i];
+        if (i > 0 && ch != ' ' && str[i - 1] != ' ') {
+            if (invert) {
+                for (uint8_t dy = 0; dy < 7; dy++) {
+                    fb_set_pixel(fb, cx, (uint8_t)(y + dy), true);
+                }
+            }
+            cx = (uint8_t)(cx + 1);
+        }
+        if (ch == ' ') {
+            if (invert) {
+                fb_fill_rect(fb, cx, y, 2, 7, true);
+            }
+            cx = (uint8_t)(cx + 2);
+        } else if (ch == ':') {
+            uint8_t colon = 0x14;
+            fb_draw_cols7(fb, cx, y, &colon, 1, invert);
+            cx = (uint8_t)(cx + 1);
+        } else {
+            if (ch >= 'a' && ch <= 'z') {
+                ch = (char)(ch - 'a' + 'A');
+            }
+            uint8_t g[4];
+            uint8_t gw = 3;
+            if (get_glyph4x7_wide(ch, g)) {
+                gw = 4;
+            } else {
+                get_glyph3x7(ch, g);
+            }
+            fb_draw_cols7(fb, cx, y, g, gw, invert);
+            cx = (uint8_t)(cx + gw);
+        }
+    }
+}
+
+static void format_uint_str(uint8_t val, char *out, uint8_t min_digits) {
+    char    tmp[4];
+    uint8_t n = 0;
+    do {
+        tmp[n++] = (char)('0' + (val % 10U));
+        val      = (uint8_t)(val / 10U);
+    } while (val > 0 || n < min_digits);
+    for (uint8_t i = 0; i < n; i++) {
+        out[i] = tmp[n - 1 - i];
+    }
+    out[n] = '\0';
+}
+
+static void fb_draw_bar(uint8_t *fb, uint8_t x, uint8_t y, uint8_t w, uint8_t h, uint8_t val, uint8_t max_val) {
+    fb_draw_rect(fb, x, y, w, h);
+    if (w > 4 && h > 4 && max_val > 0) {
+        uint8_t clamped = (val > max_val) ? max_val : val;
+        uint8_t inner_w = (uint8_t)(w - 4);
+        uint8_t fill_w  = (uint8_t)(((uint16_t)clamped * inner_w + (max_val / 2U)) / max_val);
+        if (clamped > 0 && fill_w == 0) {
+            fill_w = 1;
+        }
+        if (fill_w > 0) {
+            fb_fill_rect(fb, (uint8_t)(x + 2), (uint8_t)(y + 2), fill_w, (uint8_t)(h - 4), true);
+        }
+    }
+}
+
 static void fb_draw_cell(uint8_t *fb, uint8_t cx, uint8_t cy, const char label[4], bool active, bool is_knob, bool is_empty) {
     if (is_empty || label[0] == '\0') {
         if (active) {
@@ -1417,6 +1876,29 @@ static void fb_draw_cell(uint8_t *fb, uint8_t cx, uint8_t cy, const char label[4
     }
 }
 
+static const uint8_t oled_col_x[6]     = {0, 11, 22, 33, 44, 55};
+static const uint8_t oled_stagger_l[6] = {4, 4, 2, 0, 2, 3};
+static const uint8_t oled_stagger_r[6] = {3, 2, 0, 2, 4, 4};
+
+static void format_layer_conn_header(uint8_t top_layer, oled_conn_mode_t conn_mode, char hdr[7]) {
+    static const char PROGMEM conn_names[4][5] = {
+        "TRRS",
+        "SYNC",
+        "WAIT",
+        "N/C",
+    };
+    const char *cname = (conn_mode <= OLED_CONN_DISC) ? conn_names[conn_mode] : "N/C";
+    hdr[0]            = (top_layer < 10) ? (char)('0' + top_layer) : '?';
+    hdr[1]            = ':';
+    uint8_t hlen      = 2;
+    for (uint8_t i = 0; i < 4; i++) {
+        char ch = (conn_mode <= OLED_CONN_DISC) ? (char)pgm_read_byte(&cname[i]) : cname[i];
+        if (ch == '\0') break;
+        hdr[hlen++] = ch;
+    }
+    hdr[hlen] = '\0';
+}
+
 static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, oled_conn_mode_t conn_mode, uint8_t mods, bool caps, const uint8_t pressed_rows[5], const uint16_t keys[5][6], uint16_t enc_ccw, uint16_t enc_cw) {
     memset(fb, 0, OLED_MATRIX_SIZE);
 
@@ -1425,39 +1907,9 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, ole
     bool alt   = (mods & MOD_MASK_ALT) != 0;
     bool gui   = (mods & MOD_MASK_GUI) != 0;
 
-    static const char PROGMEM conn_names[4][5] = {
-        "TRRS",
-        "SYNC",
-        "WAIT",
-        "N/C",
-    };
-    const char *cname = (conn_mode <= OLED_CONN_DISC) ? conn_names[conn_mode] : "N/C";
-    char        hdr[7];
-    hdr[0]       = (top_layer < 10) ? (char)('0' + top_layer) : '?';
-    hdr[1]       = ':';
-    uint8_t hlen = 2;
-    for (uint8_t i = 0; i < 4; i++) {
-        char ch = (conn_mode <= OLED_CONN_DISC) ? (char)pgm_read_byte(&cname[i]) : cname[i];
-        if (ch == '\0') break;
-        hdr[hlen++] = ch;
-    }
-    hdr[hlen] = '\0';
-
-    uint8_t hx = 0;
-    for (uint8_t i = 0; i < 6; i++) {
-        char ch = hdr[i];
-        if (ch == '\0') break;
-        if (ch == ':') {
-            uint8_t colon = 0x14;
-            fb_draw_cols7(fb, hx, 1, &colon, 1, false);
-            hx = (uint8_t)(hx + 2);
-        } else {
-            uint8_t g[3];
-            get_glyph3x7(ch, g);
-            fb_draw_cols7(fb, hx, 1, g, 3, false);
-            hx = (uint8_t)(hx + 4);
-        }
-    }
+    char hdr[7];
+    format_layer_conn_header(top_layer, conn_mode, hdr);
+    fb_draw_text3x7(fb, 0, 1, hdr, false);
 
     const char mod_chars[5]  = {'S', 'C', 'A', 'G', 'L'};
     const bool mod_active[5] = {shift, ctrl, alt, gui, caps};
@@ -1466,26 +1918,17 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, ole
         uint8_t g[3];
         get_glyph3x7(mod_chars[i], g);
         if (mod_active[i]) {
-            for (uint8_t dy = 0; dy < 9; dy++) {
-                for (uint8_t dx = 0; dx < 5; dx++) {
-                    fb_set_pixel(fb, (uint8_t)(bx + dx), dy, true);
-                }
-            }
+            fb_fill_rect(fb, bx, 0, 5, 9, true);
             fb_draw_cols7(fb, (uint8_t)(bx + 1), 1, g, 3, true);
         } else {
             fb_draw_cols7(fb, (uint8_t)(bx + 1), 1, g, 3, false);
         }
     }
 
-    for (uint8_t x = 0; x < OLED_PORTRAIT_W; x++) {
-        fb_set_pixel(fb, x, 10, true);
-    }
+    fb_draw_hline(fb, 0, 10, OLED_PORTRAIT_W, false);
 
-    static const uint8_t col_x[6]     = {0, 11, 22, 33, 44, 55};
-    static const uint8_t stagger_l[6] = {4, 4, 2, 0, 2, 3};
-    static const uint8_t stagger_r[6] = {3, 2, 0, 2, 4, 4};
-    static const int8_t  thumb_l[6]   = {2, 1, 0, 1, 2, -2};
-    static const int8_t  thumb_r[6]   = {-2, 2, 1, 0, 1, 2};
+    static const int8_t thumb_l[6] = {2, 1, 0, 1, 2, -2};
+    static const int8_t thumb_r[6] = {-2, 2, 1, 0, 1, 2};
 
     for (uint8_t r = 0; r < 5; r++) {
         for (uint8_t disp_c = 0; disp_c < 6; disp_c++) {
@@ -1495,11 +1938,11 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, ole
             format_keycode_label(kc, shift, caps, lbl);
             bool    pressed = (pressed_rows[r] & (1U << mat_c)) != 0;
             bool    act     = pressed || is_kc_active_pill(kc, top_layer, mods, caps);
-            uint8_t cx      = col_x[disp_c];
+            uint8_t cx      = oled_col_x[disp_c];
             bool    is_knob = (r == 4 && mat_c == 5);
             uint8_t cy;
             if (r < 4) {
-                uint8_t stg = is_left ? stagger_l[disp_c] : stagger_r[disp_c];
+                uint8_t stg = is_left ? oled_stagger_l[disp_c] : oled_stagger_r[disp_c];
                 cy          = (uint8_t)(13 + r * 17 + stg);
             } else {
                 int8_t arc = is_left ? thumb_l[disp_c] : thumb_r[disp_c];
@@ -1509,9 +1952,7 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, ole
         }
     }
 
-    for (uint8_t x = 0; x < OLED_PORTRAIT_W; x += 2) {
-        fb_set_pixel(fb, x, 109, true);
-    }
+    fb_draw_hline(fb, 0, 109, OLED_PORTRAIT_W, true);
 
     char lbl_ccw[4], lbl_cw[4];
     format_keycode_label(enc_ccw, shift, caps, lbl_ccw);
@@ -1540,7 +1981,7 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, ole
 }
 
 typedef struct {
-    bool             valid;
+    oled_app_t       app;
     bool             is_left;
     uint8_t          top_layer;
     oled_conn_mode_t conn_mode;
@@ -1550,6 +1991,415 @@ typedef struct {
     uint16_t         keys[5][6];
     uint16_t         enc_ccw;
     uint16_t         enc_cw;
+    uint16_t         peer_enc_ccw;
+    uint16_t         peer_enc_cw;
+    uint8_t          rgb_enable;
+    uint8_t          rgb_mode;
+    uint8_t          rgb_h;
+    uint8_t          rgb_s;
+    uint8_t          rgb_v;
+    uint8_t          rgb_speed;
+} oled_app_ctx_t;
+
+typedef void (*oled_app_render_fn)(uint8_t *fb, const oled_app_ctx_t *ctx);
+
+static void copy_short_str(char *dst, const char *src, uint8_t max_len) {
+    uint8_t i = 0;
+    for (; i + 1 < max_len && src[i] != '\0'; i++) {
+        dst[i] = src[i];
+    }
+    dst[i] = '\0';
+}
+
+static void set_mode_lines(char line1[15], char line2[15], const char *l1, const char *l2) {
+    copy_short_str(line1, l1, 15);
+    copy_short_str(line2, l2, 15);
+}
+
+static void get_rgb_mode_name_lines(uint8_t mode, char line1[15], char line2[15]) {
+#ifdef RGB_MATRIX_ENABLE
+    switch (mode) {
+        case RGB_MATRIX_SOLID_COLOR:
+            set_mode_lines(line1, line2, "SOLID", "COLOR");
+            return;
+#    ifdef ENABLE_RGB_MATRIX_GRADIENT_UP_DOWN
+        case RGB_MATRIX_GRADIENT_UP_DOWN:
+            set_mode_lines(line1, line2, "GRADIENT", "UP/DOWN");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_GRADIENT_UP_DOWN_VAL
+        case RGB_MATRIX_GRADIENT_UP_DOWN_VAL:
+            set_mode_lines(line1, line2, "BRIGHTNESS", "GRADIENT");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_GRADIENT_LEFT_RIGHT
+        case RGB_MATRIX_GRADIENT_LEFT_RIGHT:
+            set_mode_lines(line1, line2, "GRADIENT", "L/R");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_RAINBOW_MOVING_CHEVRON
+        case RGB_MATRIX_RAINBOW_MOVING_CHEVRON:
+            set_mode_lines(line1, line2, "RAINBOW", "CHEVRON");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_BREATHING
+        case RGB_MATRIX_BREATHING:
+            set_mode_lines(line1, line2, "BREATHING", "");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_CYCLE_ALL
+        case RGB_MATRIX_CYCLE_ALL:
+            set_mode_lines(line1, line2, "CYCLE", "ALL");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_CYCLE_LEFT_RIGHT
+        case RGB_MATRIX_CYCLE_LEFT_RIGHT:
+            set_mode_lines(line1, line2, "CYCLE", "L/R");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_CYCLE_UP_DOWN
+        case RGB_MATRIX_CYCLE_UP_DOWN:
+            set_mode_lines(line1, line2, "CYCLE", "UP/DOWN");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_CYCLE_OUT_IN
+        case RGB_MATRIX_CYCLE_OUT_IN:
+            set_mode_lines(line1, line2, "CYCLE", "OUT/IN");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_CYCLE_PINWHEEL
+        case RGB_MATRIX_CYCLE_PINWHEEL:
+            set_mode_lines(line1, line2, "CYCLE", "PINWHEEL");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_CYCLE_SPIRAL
+        case RGB_MATRIX_CYCLE_SPIRAL:
+            set_mode_lines(line1, line2, "CYCLE", "SPIRAL");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_HUE_BREATHING
+        case RGB_MATRIX_HUE_BREATHING:
+            set_mode_lines(line1, line2, "HUE", "BREATH");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_HUE_PENDULUM
+        case RGB_MATRIX_HUE_PENDULUM:
+            set_mode_lines(line1, line2, "HUE", "PENDUL");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_HUE_WAVE
+        case RGB_MATRIX_HUE_WAVE:
+            set_mode_lines(line1, line2, "HUE", "WAVE");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_RAINDROPS
+        case RGB_MATRIX_RAINDROPS:
+            set_mode_lines(line1, line2, "RAINDROP", "");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_TYPING_HEATMAP
+        case RGB_MATRIX_TYPING_HEATMAP:
+            set_mode_lines(line1, line2, "TYPING", "HEATMAP");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_DIGITAL_RAIN
+        case RGB_MATRIX_DIGITAL_RAIN:
+            set_mode_lines(line1, line2, "DIGITAL", "RAIN");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_SOLID_REACTIVE_SIMPLE
+        case RGB_MATRIX_SOLID_REACTIVE_SIMPLE:
+            set_mode_lines(line1, line2, "REACTIVE", "SIMPLE");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_SOLID_REACTIVE
+        case RGB_MATRIX_SOLID_REACTIVE:
+            set_mode_lines(line1, line2, "SOLID", "REACTIVE");
+            return;
+#    endif
+#    ifdef ENABLE_RGB_MATRIX_SPLASH
+        case RGB_MATRIX_SPLASH:
+            set_mode_lines(line1, line2, "SPLASH", "");
+            return;
+#    endif
+        default:
+            break;
+    }
+#endif
+    copy_short_str(line1, "MODE", 15);
+    line2[0] = '#';
+    format_uint_str(mode, line2 + 1, 1);
+}
+
+static const char *get_hue_color_tag(uint8_t h) {
+    if (h <= 14 || h >= 241) return "RED";
+    if (h <= 35) return "ORG";
+    if (h <= 56) return "YEL";
+    if (h <= 105) return "GRN";
+    if (h <= 148) return "CYN";
+    if (h <= 190) return "BLU";
+    if (h <= 220) return "PUR";
+    return "PNK";
+}
+
+static void format_ratio_str(uint8_t a, uint8_t b, char out[10]) {
+    format_uint_str(a, out, 1);
+    uint8_t len = (uint8_t)strlen(out);
+    out[len++]  = '/';
+    format_uint_str(b, out + len, 1);
+}
+
+static void render_oled_rgb_left(uint8_t *fb, const oled_app_ctx_t *ctx) {
+    memset(fb, 0, OLED_MATRIX_SIZE);
+
+    fb_draw_text3x7(fb, 0, 1, "RGB", false);
+    if (ctx->rgb_enable) {
+        uint8_t on_w = (uint8_t)(fb_measure_text3x7("ON") + 4);
+        fb_fill_rect(fb, 15, 0, on_w, 9, true);
+        fb_draw_text3x7(fb, 17, 1, "ON", true);
+    } else {
+        uint8_t off_w = (uint8_t)(fb_measure_text3x7("OFF") + 4);
+        fb_draw_rect(fb, 15, 0, off_w, 9);
+        fb_draw_text3x7(fb, 17, 1, "OFF", false);
+    }
+
+    char page[10];
+    format_ratio_str((uint8_t)(ctx->app + 1), OLED_APP_COUNT, page);
+    uint8_t pw = fb_measure_text3x7(page);
+    fb_draw_text3x7(fb, (uint8_t)(OLED_PORTRAIT_W - pw), 1, page, false);
+
+    fb_draw_hline(fb, 0, 10, OLED_PORTRAIT_W, false);
+
+    fb_draw_text3x7(fb, 0, 13, "MODE", false);
+#ifdef RGB_MATRIX_ENABLE
+    uint8_t total_modes = (RGB_MATRIX_EFFECT_MAX > 1) ? (uint8_t)(RGB_MATRIX_EFFECT_MAX - 1) : 1;
+#else
+    uint8_t total_modes = 1;
+#endif
+    char mode_ratio[10];
+    format_ratio_str(ctx->rgb_mode, total_modes, mode_ratio);
+    uint8_t mrw = fb_measure_text3x7(mode_ratio);
+    fb_draw_text3x7(fb, (uint8_t)(OLED_PORTRAIT_W - mrw), 13, mode_ratio, false);
+
+    fb_draw_rect(fb, 0, 21, OLED_PORTRAIT_W, 21);
+    char l1[15], l2[15];
+    get_rgb_mode_name_lines(ctx->rgb_mode, l1, l2);
+    if (l2[0] != '\0') {
+        uint8_t w1 = fb_measure_text3x7(l1);
+        uint8_t w2 = fb_measure_text3x7(l2);
+        fb_draw_text3x7(fb, (OLED_PORTRAIT_W > w1) ? (uint8_t)((OLED_PORTRAIT_W - w1) / 2) : 1, 23, l1, false);
+        fb_draw_text3x7(fb, (OLED_PORTRAIT_W > w2) ? (uint8_t)((OLED_PORTRAIT_W - w2) / 2) : 1, 32, l2, false);
+    } else {
+        uint8_t w1 = fb_measure_text3x7(l1);
+        fb_draw_text3x7(fb, (OLED_PORTRAIT_W > w1) ? (uint8_t)((OLED_PORTRAIT_W - w1) / 2) : 1, 28, l1, false);
+    }
+
+#ifdef RGB_MATRIX_ENABLE
+    uint8_t bri_max = (RGB_MATRIX_MAXIMUM_BRIGHTNESS > 0) ? RGB_MATRIX_MAXIMUM_BRIGHTNESS : 255;
+#else
+    uint8_t bri_max = 255;
+#endif
+    const char *const labels[4] = {"HUE", "SAT", "BRI", "SPD"};
+    const uint8_t     vals[4]   = {ctx->rgb_h, ctx->rgb_s, ctx->rgb_v, ctx->rgb_speed};
+    const uint8_t     maxs[4]   = {255, 255, bri_max, 255};
+    for (uint8_t i = 0; i < 4; i++) {
+        uint8_t ry = (uint8_t)(45 + i * 18);
+        fb_draw_text3x7(fb, 0, ry, labels[i], false);
+
+        char mid[6];
+        if (i == 0) {
+            copy_short_str(mid, get_hue_color_tag(vals[0]), sizeof(mid));
+        } else {
+            uint16_t clamped = (vals[i] > maxs[i]) ? maxs[i] : vals[i];
+            uint8_t  pct     = (uint8_t)(((uint32_t)clamped * 100U + (maxs[i] / 2U)) / maxs[i]);
+            format_uint_str(pct, mid, 1);
+            uint8_t len  = (uint8_t)strlen(mid);
+            mid[len]     = '%';
+            mid[len + 1] = '\0';
+        }
+        uint8_t mw = fb_measure_text3x7(mid);
+        fb_draw_text3x7(fb, (uint8_t)(47 - mw), ry, mid, false);
+
+        char raw_s[5];
+        format_uint_str(vals[i], raw_s, 1);
+        uint8_t rw = fb_measure_text3x7(raw_s);
+        fb_draw_text3x7(fb, (uint8_t)(OLED_PORTRAIT_W - rw), ry, raw_s, false);
+
+        fb_draw_bar(fb, 0, (uint8_t)(ry + 8), OLED_PORTRAIT_W, 7, vals[i], maxs[i]);
+    }
+
+    fb_draw_hline(fb, 0, 117, OLED_PORTRAIT_W, true);
+    char hdr[7];
+    format_layer_conn_header(ctx->top_layer, ctx->conn_mode, hdr);
+    fb_draw_text3x7(fb, 0, 120, hdr, false);
+    uint8_t aw = fb_measure_text3x7("R:APP");
+    fb_draw_text3x7(fb, (uint8_t)(OLED_PORTRAIT_W - aw), 120, "R:APP", false);
+}
+
+static void append_sanitized_lbl(char *dst, uint8_t *pos, uint8_t max_len, const char lbl[4]) {
+    if (lbl[0] == '\0') {
+        if (*pos + 2 < max_len) {
+            dst[(*pos)++] = '-';
+            dst[(*pos)++] = '-';
+        }
+        return;
+    }
+    for (uint8_t i = 0; i < 3 && lbl[i] != '\0' && (*pos + 1) < max_len; i++) {
+        char ch = lbl[i];
+        if (ch == CHAR_ARROW_UP) {
+            ch = '^';
+        } else if (ch == CHAR_ARROW_DOWN) {
+            ch = 'V';
+        } else if (ch == CHAR_ARROW_LEFT) {
+            ch = '<';
+        } else if (ch == CHAR_ARROW_RGHT) {
+            ch = '>';
+        }
+        dst[(*pos)++] = ch;
+    }
+}
+
+static void format_rgb_enc_desc(uint16_t ccw, uint16_t cw, char out[12]) {
+    const char *preset = NULL;
+    if (ccw == RM_VALD && cw == RM_VALU) {
+        preset = "BRI -/+";
+    } else if (ccw == RM_VALU && cw == RM_VALD) {
+        preset = "BRI +/-";
+    } else if (ccw == RM_HUED && cw == RM_HUEU) {
+        preset = "HUE -/+";
+    } else if (ccw == RM_HUEU && cw == RM_HUED) {
+        preset = "HUE +/-";
+    } else if (ccw == RM_SATD && cw == RM_SATU) {
+        preset = "SAT -/+";
+    } else if (ccw == RM_SATU && cw == RM_SATD) {
+        preset = "SAT +/-";
+    } else if (ccw == RM_SPDD && cw == RM_SPDU) {
+        preset = "SPD -/+";
+    } else if (ccw == RM_SPDU && cw == RM_SPDD) {
+        preset = "SPD +/-";
+    } else if (ccw == RM_PREV && cw == RM_NEXT) {
+        preset = "MOD -/+";
+    } else if (ccw == RM_NEXT && cw == RM_PREV) {
+        preset = "MOD +/-";
+    } else if ((ccw == KC_VOLD || ccw == KC_KB_VOLUME_DOWN) && (cw == KC_VOLU || cw == KC_KB_VOLUME_UP)) {
+        preset = "VOL -/+";
+    } else if ((ccw == KC_VOLU || ccw == KC_KB_VOLUME_UP) && (cw == KC_VOLD || cw == KC_KB_VOLUME_DOWN)) {
+        preset = "VOL +/-";
+    } else if ((ccw == MS_WHLU && cw == MS_WHLD) || (ccw == MS_WHLD && cw == MS_WHLU)) {
+        preset = "SCROLL";
+    } else if ((ccw == KC_NO || ccw == KC_TRNS) && (cw == KC_NO || cw == KC_TRNS)) {
+        preset = "NONE";
+    }
+
+    if (preset != NULL) {
+        copy_short_str(out, preset, 12);
+        return;
+    }
+
+    char lbl_ccw[4], lbl_cw[4];
+    format_keycode_label(ccw, false, false, lbl_ccw);
+    format_keycode_label(cw, false, false, lbl_cw);
+
+    uint8_t pos = 0;
+    append_sanitized_lbl(out, &pos, 12, lbl_ccw);
+    if (pos + 1 < 12) {
+        out[pos++] = '/';
+    }
+    append_sanitized_lbl(out, &pos, 12, lbl_cw);
+    out[pos] = '\0';
+}
+
+static void render_oled_rgb_right(uint8_t *fb, const oled_app_ctx_t *ctx) {
+    memset(fb, 0, OLED_MATRIX_SIZE);
+
+    if (ctx->top_layer == _ADJUST) {
+        fb_fill_rect(fb, 0, 0, 13, 9, true);
+        fb_draw_text3x7(fb, 1, 1, "ADJ", true);
+    } else {
+        fb_draw_text3x7(fb, 1, 1, "ADJ", false);
+    }
+    fb_draw_text3x7(fb, 15, 1, "LIVE", false);
+
+    char page[10];
+    format_ratio_str((uint8_t)(ctx->app + 1), OLED_APP_COUNT, page);
+    uint8_t pw = fb_measure_text3x7(page);
+    fb_draw_text3x7(fb, (uint8_t)(OLED_PORTRAIT_W - pw), 1, page, false);
+
+    fb_draw_hline(fb, 0, 10, OLED_PORTRAIT_W, false);
+
+    for (uint8_t r = 0; r < 4; r++) {
+        for (uint8_t disp_c = 0; disp_c < 6; disp_c++) {
+            uint8_t  mat_c   = (uint8_t)(5 - disp_c);
+            uint16_t kc      = ctx->keys[r][mat_c];
+            char     lbl[4];
+            format_keycode_label(kc, false, false, lbl);
+            bool    pressed = (ctx->pressed_rows[r] & (1U << mat_c)) != 0;
+            bool    empty   = (kc == KC_NO || kc == KC_TRNS);
+            uint8_t cx      = oled_col_x[disp_c];
+            uint8_t cy      = (uint8_t)(12 + r * 15 + (oled_stagger_r[disp_c] >> 1));
+            fb_draw_cell(fb, cx, cy, lbl, pressed, false, empty);
+        }
+    }
+
+    fb_draw_hline(fb, 0, 75, OLED_PORTRAIT_W, true);
+
+    static const char *const legend[3][2] = {
+        {"H:HUE", "S:SAT"},
+        {"B:BRI", "P:SPD"},
+        {"R:MOD", "RG:ON"},
+    };
+    for (uint8_t i = 0; i < 3; i++) {
+        uint8_t ly = (uint8_t)(78 + i * 9);
+        fb_draw_text3x7(fb, 0, ly, legend[i][0], false);
+        fb_draw_text3x7(fb, 33, ly, legend[i][1], false);
+    }
+
+    fb_draw_hline(fb, 0, 105, OLED_PORTRAIT_W, true);
+
+    char desc_l[12], desc_r[12];
+    format_rgb_enc_desc(ctx->peer_enc_ccw, ctx->peer_enc_cw, desc_l);
+    format_rgb_enc_desc(ctx->enc_ccw, ctx->enc_cw, desc_r);
+
+    char enc_text[2][16];
+    copy_short_str(enc_text[0], "KNB:", sizeof(enc_text[0]));
+    copy_short_str(enc_text[0] + 4, desc_l, (uint8_t)(sizeof(enc_text[0]) - 4));
+    copy_short_str(enc_text[1], "KNB:", sizeof(enc_text[1]));
+    copy_short_str(enc_text[1] + 4, desc_r, (uint8_t)(sizeof(enc_text[1]) - 4));
+
+    uint8_t w0    = (uint8_t)(7 + fb_measure_text3x7(enc_text[0]));
+    uint8_t w1    = (uint8_t)(7 + fb_measure_text3x7(enc_text[1]));
+    uint8_t max_w = (w0 > w1) ? w0 : w1;
+    uint8_t ex    = (OLED_PORTRAIT_W > max_w) ? (uint8_t)((OLED_PORTRAIT_W - max_w) / 2) : 0;
+
+    static const char side_ch[2][2] = {"L", "R"};
+    for (uint8_t i = 0; i < 2; i++) {
+        uint8_t py = (uint8_t)(107 + i * 11);
+        fb_fill_rect(fb, ex, py, 5, 9, true);
+        fb_draw_text3x7(fb, (uint8_t)(ex + 1), (uint8_t)(py + 1), side_ch[i], true);
+        fb_draw_text3x7(fb, (uint8_t)(ex + 7), (uint8_t)(py + 1), enc_text[i], false);
+    }
+}
+
+static void render_oled_app_keymap(uint8_t *fb, const oled_app_ctx_t *ctx) {
+    render_oled_layout(fb, ctx->is_left, ctx->top_layer, ctx->conn_mode, ctx->mods, ctx->caps, ctx->pressed_rows, ctx->keys, ctx->enc_ccw, ctx->enc_cw);
+}
+
+static void render_oled_app_rgb_info(uint8_t *fb, const oled_app_ctx_t *ctx) {
+    if (ctx->is_left) {
+        render_oled_rgb_left(fb, ctx);
+    } else {
+        render_oled_rgb_right(fb, ctx);
+    }
+}
+
+static const oled_app_render_fn oled_apps[OLED_APP_COUNT] = {
+    [OLED_APP_KEYMAP]   = render_oled_app_keymap,
+    [OLED_APP_RGB_INFO] = render_oled_app_rgb_info,
+};
+
+typedef struct {
+    bool           valid;
+    oled_app_ctx_t ctx;
 } oled_render_cache_t;
 
 static oled_render_cache_t oled_cache                   = {0};
@@ -1561,63 +2411,68 @@ bool oled_task_user(void) {
         return false;
     }
 
-    bool             is_left = is_keyboard_left();
-    uint8_t          top_layer;
-    oled_conn_mode_t conn_mode;
-    uint8_t          mods;
-    bool             caps;
-    uint8_t          pressed_rows[5];
-    uint16_t         cur_keys[5][6];
-    uint16_t         cur_ccw;
-    uint16_t         cur_cw;
+    oled_app_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.app     = (current_oled_app < OLED_APP_COUNT) ? current_oled_app : OLED_APP_KEYMAP;
+    ctx.is_left = is_keyboard_left();
 
-    uint8_t row_offset = is_left ? 0 : 5;
+    uint8_t row_offset = ctx.is_left ? 0 : 5;
     for (uint8_t r = 0; r < 5; r++) {
-        pressed_rows[r] = (uint8_t)(matrix_get_row((uint8_t)(r + row_offset)) & 0x3F);
+        ctx.pressed_rows[r] = (uint8_t)(matrix_get_row((uint8_t)(r + row_offset)) & 0x3F);
     }
 
     if (!is_keyboard_master() && slave_has_hdr && slave_has_keys) {
-        top_layer = slave_hdr_state.top_layer;
-        conn_mode = OLED_CONN_TRRS;
-        mods      = slave_hdr_state.mods;
-        caps      = (slave_hdr_state.flags & SLAVE_HDR_CAPS_LOCK) != 0;
-        memcpy(cur_keys, slave_keys, sizeof(cur_keys));
-        cur_ccw = slave_enc_ccw;
-        cur_cw  = slave_enc_cw;
+        ctx.top_layer = slave_hdr_state.top_layer;
+        ctx.conn_mode = OLED_CONN_TRRS;
+        ctx.mods      = slave_hdr_state.mods;
+        ctx.caps      = (slave_hdr_state.flags & SLAVE_HDR_CAPS_LOCK) != 0;
+        memcpy(ctx.keys, slave_keys, sizeof(ctx.keys));
+        ctx.enc_ccw      = slave_enc_ccw;
+        ctx.enc_cw       = slave_enc_cw;
+        ctx.peer_enc_ccw = slave_peer_enc_ccw;
+        ctx.peer_enc_cw  = slave_peer_enc_cw;
     } else {
         layer_state_t active_mask = layer_state | default_layer_state;
-        top_layer                 = get_highest_layer(active_mask);
-        mods                      = get_local_mods();
+        ctx.top_layer             = get_highest_layer(active_mask);
+        ctx.mods                  = get_local_mods();
         if (is_transport_connected() || !is_keyboard_master()) {
-            conn_mode = OLED_CONN_TRRS;
+            ctx.conn_mode = OLED_CONN_TRRS;
         } else {
-            mods |= remote_mods;
+            ctx.mods |= remote_mods;
             if (host_service_connected && host_peer_connected) {
-                conn_mode = OLED_CONN_SYNC;
+                ctx.conn_mode = OLED_CONN_SYNC;
             } else if (host_service_connected) {
-                conn_mode = OLED_CONN_WAIT;
+                ctx.conn_mode = OLED_CONN_WAIT;
             } else {
-                conn_mode = OLED_CONN_DISC;
+                ctx.conn_mode = OLED_CONN_DISC;
             }
         }
-        caps = host_keyboard_led_state().caps_lock;
-        populate_half_keys(is_left, active_mask, top_layer, cur_keys, &cur_ccw, &cur_cw);
+        ctx.caps = host_keyboard_led_state().caps_lock;
+        if (ctx.app == OLED_APP_RGB_INFO && !ctx.is_left) {
+            populate_rgb_right_panel(ctx.keys, &ctx.enc_ccw, &ctx.enc_cw, &ctx.peer_enc_ccw, &ctx.peer_enc_cw);
+        } else {
+            populate_half_keys(ctx.is_left, active_mask, ctx.top_layer, ctx.keys, &ctx.enc_ccw, &ctx.enc_cw);
+            ctx.peer_enc_ccw = KC_NO;
+            ctx.peer_enc_cw  = KC_NO;
+        }
     }
 
-    bool changed = !oled_cache.valid || (oled_cache.is_left != is_left) || (oled_cache.top_layer != top_layer) || (oled_cache.conn_mode != conn_mode) || (oled_cache.mods != mods) || (oled_cache.caps != caps) || (oled_cache.enc_ccw != cur_ccw) || (oled_cache.enc_cw != cur_cw) || (memcmp(oled_cache.pressed_rows, pressed_rows, sizeof(pressed_rows)) != 0) || (memcmp(oled_cache.keys, cur_keys, sizeof(cur_keys)) != 0);
+#ifdef RGB_MATRIX_ENABLE
+    {
+        hsv_t hsv      = rgb_matrix_get_hsv();
+        ctx.rgb_enable = rgb_matrix_is_enabled() ? 1 : 0;
+        ctx.rgb_mode   = rgb_matrix_get_mode();
+        ctx.rgb_h      = hsv.h;
+        ctx.rgb_s      = hsv.s;
+        ctx.rgb_v      = hsv.v;
+        ctx.rgb_speed  = rgb_matrix_get_speed();
+    }
+#endif
 
-    if (changed) {
-        render_oled_layout(oled_frame, is_left, top_layer, conn_mode, mods, caps, pressed_rows, cur_keys, cur_ccw, cur_cw);
-        oled_cache.valid     = true;
-        oled_cache.is_left   = is_left;
-        oled_cache.top_layer = top_layer;
-        oled_cache.conn_mode = conn_mode;
-        oled_cache.mods      = mods;
-        oled_cache.caps      = caps;
-        memcpy(oled_cache.pressed_rows, pressed_rows, sizeof(oled_cache.pressed_rows));
-        memcpy(oled_cache.keys, cur_keys, sizeof(oled_cache.keys));
-        oled_cache.enc_ccw = cur_ccw;
-        oled_cache.enc_cw  = cur_cw;
+    if (!oled_cache.valid || memcmp(&oled_cache.ctx, &ctx, sizeof(ctx)) != 0) {
+        oled_apps[ctx.app](oled_frame, &ctx);
+        oled_cache.valid = true;
+        oled_cache.ctx   = ctx;
     }
 
     oled_set_cursor(0, 0);

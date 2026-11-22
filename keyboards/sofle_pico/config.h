@@ -33,3 +33,7 @@
 #define SPLIT_CONNECTION_CHECK_TIMEOUT 3000
 #define RPC_M2S_BUFFER_SIZE 72
 #define VIA_EEPROM_CUSTOM_CONFIG_SIZE 4
+
+/* Per-mode RGB Matrix preset storage (4B magic + 4B valid mask + 32 x 4B HSV/speed slots) */
+#define EECONFIG_USER_DATA_SIZE 136
+#define EECONFIG_USER_DATA_VERSION 0x52503031UL
