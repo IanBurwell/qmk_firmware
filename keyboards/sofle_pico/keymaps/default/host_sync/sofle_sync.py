@@ -13,12 +13,16 @@ from __future__ import annotations
 import argparse
 import ctypes
 import glob
+import json
 import os
 import select
 import struct
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -34,7 +38,15 @@ MSG_HOST_PING = 0x01
 MSG_HALF_STATE = 0x02
 MSG_IDENTIFY = 0x03
 MSG_BOOTLOADER = 0x04
+MSG_HOST_ACTION = 0x05
+HOST_ACTION_HA_HEX_TOGGLE = 0x01
 BOOTLOADER_MAGIC = b"BOOT"
+
+DEFAULT_HA_URL = "https://home-assistant.zuul-diphda.ts.net"
+DEFAULT_HA_WEBHOOK_ID = "toggle_hex_lights"
+DEFAULT_HA_ENTITY_ID = "light.h6061"
+DEFAULT_HA_TIMEOUT_S = 5.0
+DEFAULT_HA_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ha_config.json")
 
 RESCAN_INTERVAL_S = 1.5
 PING_INTERVAL_S = 0.75
@@ -72,6 +84,235 @@ def parse_half_state(payload: bytes) -> Optional[str]:
     if payload[0] != CMD_SYNC or payload[1:3] != MAGIC or payload[3] != MSG_HALF_STATE:
         return None
     return "left" if payload[4] != 0 else "right"
+
+
+def parse_host_action(payload: bytes) -> Optional[Tuple[str, int, int]]:
+    """Return (side, action_id, seq) if payload is a valid MSG_HOST_ACTION packet, else None."""
+    if len(payload) != RAW_EPSIZE:
+        return None
+    if payload[0] != CMD_SYNC or payload[1:3] != MAGIC or payload[3] != MSG_HOST_ACTION:
+        return None
+    side = "left" if payload[4] != 0 else "right"
+    return (side, payload[5], payload[6])
+
+
+@dataclass
+class HomeAssistantConfig:
+    base_url: str = DEFAULT_HA_URL
+    webhook_id: str = DEFAULT_HA_WEBHOOK_ID
+    token: str = ""
+    entity_id: str = DEFAULT_HA_ENTITY_ID
+    timeout_s: float = DEFAULT_HA_TIMEOUT_S
+
+
+def load_ha_config(
+    config_path: Optional[str] = None,
+    cli_url: Optional[str] = None,
+    cli_webhook_id: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> HomeAssistantConfig:
+    """Load Home Assistant integration settings from defaults, JSON file, env vars, and CLI flags."""
+    env_map: Dict[str, str] = os.environ if env is None else env  # type: ignore[assignment]
+    path = config_path or env_map.get("SOFLE_HA_CONFIG") or DEFAULT_HA_CONFIG_PATH
+
+    base_url = DEFAULT_HA_URL
+    webhook_id = DEFAULT_HA_WEBHOOK_ID
+    token = ""
+    entity_id = DEFAULT_HA_ENTITY_ID
+    timeout_s = DEFAULT_HA_TIMEOUT_S
+
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+            if isinstance(raw_cfg, dict):
+                if "base_url" in raw_cfg and raw_cfg["base_url"] is not None:
+                    base_url = str(raw_cfg["base_url"])
+                if "webhook_id" in raw_cfg:
+                    webhook_id = "" if raw_cfg["webhook_id"] is None else str(raw_cfg["webhook_id"])
+                if "token" in raw_cfg and raw_cfg["token"] is not None:
+                    token = str(raw_cfg["token"])
+                if "entity_id" in raw_cfg and raw_cfg["entity_id"] is not None:
+                    entity_id = str(raw_cfg["entity_id"])
+                if "timeout_s" in raw_cfg and raw_cfg["timeout_s"] is not None:
+                    try:
+                        timeout_s = float(raw_cfg["timeout_s"])
+                    except (TypeError, ValueError):
+                        print(
+                            f"[sofle-sync] Invalid timeout_s in {path}; using default",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+            else:
+                print(
+                    f"[sofle-sync] Ignoring non-object Home Assistant config in {path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"[sofle-sync] Failed to read Home Assistant config {path}: {exc}", file=sys.stderr, flush=True)
+
+    if "SOFLE_HA_URL" in env_map:
+        base_url = env_map["SOFLE_HA_URL"]
+    if "SOFLE_HA_WEBHOOK_ID" in env_map:
+        webhook_id = env_map["SOFLE_HA_WEBHOOK_ID"]
+    if "SOFLE_HA_TOKEN" in env_map:
+        token = env_map["SOFLE_HA_TOKEN"]
+    if "SOFLE_HA_ENTITY_ID" in env_map:
+        entity_id = env_map["SOFLE_HA_ENTITY_ID"]
+    if "SOFLE_HA_TIMEOUT" in env_map:
+        try:
+            timeout_s = float(env_map["SOFLE_HA_TIMEOUT"])
+        except (TypeError, ValueError):
+            print("[sofle-sync] Invalid SOFLE_HA_TIMEOUT value; using previous timeout", file=sys.stderr, flush=True)
+
+    if cli_url is not None:
+        base_url = cli_url
+    if cli_webhook_id is not None:
+        webhook_id = cli_webhook_id
+
+    base_url = base_url.strip().rstrip("/")
+    webhook_id = webhook_id.strip()
+    token = token.strip()
+    entity_id = entity_id.strip() or DEFAULT_HA_ENTITY_ID
+    timeout_s = max(0.5, float(timeout_s))
+
+    return HomeAssistantConfig(
+        base_url=base_url,
+        webhook_id=webhook_id,
+        token=token,
+        entity_id=entity_id,
+        timeout_s=timeout_s,
+    )
+
+
+def build_ha_request(cfg: HomeAssistantConfig, side: str) -> Tuple[urllib.request.Request, str]:
+    """Build an HTTP POST request and sanitized display target for Home Assistant."""
+    base_url = cfg.base_url.strip().rstrip("/")
+    if not base_url:
+        raise ValueError("Home Assistant base_url is not configured")
+
+    webhook_id = cfg.webhook_id.strip()
+    token = cfg.token.strip()
+    entity_id = cfg.entity_id.strip() or DEFAULT_HA_ENTITY_ID
+
+    headers: Dict[str, str] = {
+        "Content-Type": "application/json",
+        "User-Agent": "sofle-pico-sync/1.0",
+    }
+
+    if webhook_id:
+        encoded_id = urllib.parse.quote(webhook_id, safe="")
+        url = f"{base_url}/api/webhook/{encoded_id}"
+        display_target = f"{base_url}/api/webhook/<configured>"
+        body_obj: Dict[str, object] = {
+            "source": "sofle_pico",
+            "action": "toggle_hex_lights",
+            "side": side,
+            "entity_id": entity_id,
+        }
+    elif token:
+        if entity_id.startswith("automation."):
+            api_path = "/api/services/automation/trigger"
+        else:
+            domain = entity_id.split(".", 1)[0] if "." in entity_id else "homeassistant"
+            api_path = f"/api/services/{urllib.parse.quote(domain, safe='')}/toggle"
+        url = f"{base_url}{api_path}"
+        display_target = url
+        headers["Authorization"] = f"Bearer {token}"
+        body_obj = {"entity_id": entity_id}
+    else:
+        raise ValueError("Home Assistant webhook_id or token not configured")
+
+    data = json.dumps(body_obj).encode("utf-8")
+    req = urllib.request.Request(url=url, data=data, headers=headers, method="POST")
+    return req, display_target
+
+
+class HomeAssistantActionDispatcher:
+    """Dispatches host-side keyboard actions asynchronously to Home Assistant."""
+
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        cli_url: Optional[str] = None,
+        cli_webhook_id: Optional[str] = None,
+        verbose: bool = False,
+        opener: Optional[Callable[..., object]] = None,
+        max_inflight: int = 4,
+    ) -> None:
+        self.config_path = config_path
+        self.cli_url = cli_url
+        self.cli_webhook_id = cli_webhook_id
+        self.verbose = verbose
+        self._opener = urllib.request.urlopen if opener is None else opener
+        self._inflight = threading.Semaphore(max(1, max_inflight))
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"[sofle-sync] {msg}", flush=True)
+
+    def trigger_hex_toggle(self, side: str = "cli") -> bool:
+        cfg = load_ha_config(
+            config_path=self.config_path,
+            cli_url=self.cli_url,
+            cli_webhook_id=self.cli_webhook_id,
+        )
+        display_target = cfg.base_url or "<unconfigured>"
+        try:
+            req, display_target = build_ha_request(cfg, side=side)
+        except ValueError as exc:
+            print(f"[sofle-sync] Home Assistant config error ({display_target}): {exc}", file=sys.stderr, flush=True)
+            return False
+
+        try:
+            with self._opener(req, timeout=cfg.timeout_s) as resp:  # type: ignore[attr-defined]
+                status = getattr(resp, "status", None)
+                if status is None and hasattr(resp, "getcode"):
+                    status = resp.getcode()
+                if status is None:
+                    status = 200
+                self._log(f"Home Assistant hex toggle ({side}) -> {display_target} HTTP {status}")
+                return 200 <= int(status) < 300
+        except urllib.error.HTTPError as exc:
+            print(
+                f"[sofle-sync] Home Assistant request failed ({side} -> {display_target}): HTTP {exc.code} {exc.reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            print(
+                f"[sofle-sync] Home Assistant request failed ({side} -> {display_target}): {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+
+    def _run_hex_toggle_worker(self, side: str) -> None:
+        try:
+            self.trigger_hex_toggle(side=side)
+        finally:
+            self._inflight.release()
+
+    def dispatch_async(self, side: str, action_id: int, seq: int) -> None:
+        if action_id != HOST_ACTION_HA_HEX_TOGGLE:
+            self._log(f"Ignoring unknown host action id={action_id} from {side} (seq={seq})")
+            return
+        if not self._inflight.acquire(blocking=False):
+            print(
+                f"[sofle-sync] Dropping hex toggle from {side} (seq={seq}): too many requests in flight",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        t = threading.Thread(
+            target=self._run_hex_toggle_worker,
+            args=(side,),
+            name=f"sofle-ha-{seq}",
+            daemon=True,
+        )
+        t.start()
 
 
 def is_qmk_raw_hid_descriptor(desc: bytes) -> bool:
@@ -119,8 +360,13 @@ def is_qmk_raw_hid_descriptor(desc: bytes) -> bool:
 class BridgeCoordinator:
     """Tracks Left/Right device sessions, pairing handshake, and packet routing."""
 
-    def __init__(self, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        action_handler: Optional[Callable[[str, int, int], None]] = None,
+    ) -> None:
         self.verbose = verbose
+        self.action_handler = action_handler
         self.lock = threading.RLock()
         self.devices: Dict[str, object] = {}
         self.sides: Dict[str, Optional[str]] = {}  # key -> "left" | "right" | None
@@ -172,6 +418,16 @@ class BridgeCoordinator:
     def handle_packet(self, src_key: str, raw: bytes) -> None:
         payload = normalize_raw_report(raw)
         if payload is None:
+            return
+        action = parse_host_action(payload)
+        if action is not None:
+            handler: Optional[Callable[[str, int, int], None]] = None
+            with self.lock:
+                if src_key not in self.devices:
+                    return
+                handler = self.action_handler
+            if handler is not None:
+                handler(action[0], action[1], action[2])
             return
         side = parse_half_state(payload)
         if side is None:
@@ -984,11 +1240,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="HID backend (default: hidraw on Linux, win32 on Windows, hidapi on macOS)",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Log pairing and hotplug events")
+    parser.add_argument("--ha-config", default=None, help="Path to ha_config.json override")
+    parser.add_argument("--ha-url", default=None, help="Home Assistant base URL override")
+    parser.add_argument("--ha-webhook-id", default=None, help="Home Assistant webhook ID override")
+    parser.add_argument(
+        "--test-hex-toggle",
+        action="store_true",
+        help="Send a one-shot Home Assistant hex lights toggle request and exit",
+    )
     args = parser.parse_args(argv)
+
+    dispatcher = HomeAssistantActionDispatcher(
+        config_path=args.ha_config,
+        cli_url=args.ha_url,
+        cli_webhook_id=args.ha_webhook_id,
+        verbose=args.verbose,
+    )
+
+    if args.test_hex_toggle:
+        ok = dispatcher.trigger_hex_toggle(side="cli")
+        return 0 if ok else 1
 
     backend = resolve_backend(args.backend)
 
-    coord = BridgeCoordinator(verbose=args.verbose)
+    coord = BridgeCoordinator(verbose=args.verbose, action_handler=dispatcher.dispatch_async)
     if args.verbose:
         print(f"[sofle-sync] Starting on {sys.platform} using '{backend}' backend", flush=True)
 

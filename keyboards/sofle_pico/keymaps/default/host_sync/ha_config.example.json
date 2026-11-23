@@ -1,0 +1,6 @@
+{
+  "base_url": "https://home-assistant.zuul-diphda.ts.net",
+  "webhook_id": "toggle_hex_lights",
+  "entity_id": "light.h6061",
+  "timeout_s": 5.0
+}

@@ -24,6 +24,62 @@
 #    include "rgb_matrix.h"
 #endif
 
+#include "usb_device_state.h"
+
+#if defined(PROTOCOL_CHIBIOS) && defined(MCU_RP)
+#    include "usb_main.h"
+
+extern usb_endpoint_out_t usb_endpoints_out[USB_ENDPOINT_OUT_COUNT];
+
+#    define SOFLE_USB_RECOVERY_ENABLED 1
+#    define USB_STATE_IS_SUSPENDED() (USB_DRIVER.state == USB_SUSPENDED)
+#    define USB_STATE_IS_ACTIVE() (USB_DRIVER.state == USB_ACTIVE)
+#    define USB_REMOTE_WAKEUP_ENABLED() ((USB_DRIVER.status & 2U) != 0U)
+
+static void sofle_usb_arm_sof_wakeup(void) {
+    osalSysLock();
+    if (USB_DRIVER.state == USB_SUSPENDED && (USB->INTE & USB_INTE_DEV_SOF) == 0U) {
+        // Clear any stale pre-suspend SOF latch before arming SOF resume interrupt
+        (void)USB->SOFRD;
+        USB->INTE |= USB_INTE_DEV_SOF;
+    }
+    osalSysUnlock();
+}
+
+static void sofle_usb_restart(void) {
+    restart_usb_driver(&USB_DRIVER);
+}
+
+static void sofle_usb_rearm_raw_out(void) {
+#    ifdef RAW_ENABLE
+    osalSysLock();
+    if (usbGetDriverStateI(&USB_DRIVER) == USB_ACTIVE) {
+        usb_endpoint_out_t *ep = &usb_endpoints_out[USB_ENDPOINT_OUT_RAW];
+        if (ep->config.usbp == &USB_DRIVER && USB_DRIVER.epc[ep->config.ep] != NULL && USB_DRIVER.epc[ep->config.ep]->out_state != NULL && !usbGetReceiveStatusI(ep->config.usbp, ep->config.ep)) {
+            uint8_t *buffer = ibqGetEmptyBufferI(&ep->ibqueue);
+            if (buffer != NULL) {
+                USBOutEndpointState *oesp = USB_DRIVER.epc[ep->config.ep]->out_state;
+                size_t               len  = ep->ibqueue.bsize - sizeof(size_t);
+                if ((USB_DPSRAM->BUFCTRL[ep->config.ep].OUT & USB_BUFFER_BUFFER0_AVAILABLE) != 0U) {
+                    // Hardware buffer is still armed from pre-suspend; preserve DATA0/DATA1 PID
+                    oesp->rxbuf  = buffer;
+                    oesp->rxcnt  = 0;
+                    oesp->rxsize = len;
+                    oesp->rxpkts = 1;
+                    USB_DRIVER.receiving |= (uint16_t)(1U << ep->config.ep);
+                } else {
+                    usbStartReceiveI(ep->config.usbp, ep->config.ep, buffer, len);
+                }
+            }
+        }
+    }
+    osalSysUnlock();
+#    endif
+}
+#elif defined(SOFLE_USB_RECOVERY_TEST)
+#    define SOFLE_USB_RECOVERY_ENABLED 1
+#endif
+
 #define USR_BTN_PIN GP24
 #define USR_LED_PIN GP25
 
@@ -32,6 +88,10 @@ enum sofle_layers {
     _LOWER,
     _RAISE,
     _ADJUST,
+};
+
+enum sofle_keycodes {
+    HA_HEX_TOGG = SAFE_RANGE,
 };
 
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
@@ -60,7 +120,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     [_ADJUST] = LAYOUT(
         QK_BOOT,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,                            RM_HUED,  RM_HUEU,  RM_SATD,  RM_SATU,  XXXXXXX,  XXXXXXX,
         XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,                            RM_NEXT,  RM_VALD,  RM_VALU,  RM_TOGG,  RM_SPDU,  XXXXXXX,
-        XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,                            RM_PREV,  KC_VOLD,  KC_MUTE,  KC_VOLU,  RM_SPDD,  XXXXXXX,
+        XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  HA_HEX_TOGG, XXXXXXX,                         RM_PREV,  KC_VOLD,  KC_MUTE,  KC_VOLU,  RM_SPDD,  XXXXXXX,
         XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,        XXXXXXX,  RM_TOGG,  _______,  _______,  _______,  XXXXXXX,  XXXXXXX,
                             _______,  _______,  _______,  _______,  _______,        _______,  _______,  _______,  _______,  _______
     )
@@ -488,6 +548,8 @@ static inline void rgb_presets_track_and_apply_local(void) {}
 #define RAW_MSG_HALF_STATE        0x02
 #define RAW_MSG_IDENTIFY          0x03
 #define RAW_MSG_BOOTLOADER        0x04
+#define RAW_MSG_HOST_ACTION       0x05
+#define HOST_ACTION_HA_HEX_TOGGLE 0x01
 #define RAW_BOOTLOADER_DELAY_MS   60
 #define HOST_SYNC_TIMEOUT_MS      2500
 #define ACTIVITY_WAKE_THROTTLE_MS 1000
@@ -516,6 +578,7 @@ static uint8_t             remote_mods              = 0;
 static uint8_t             last_sent_mods           = 0;
 static uint8_t             local_rgb_seq            = 0;
 static uint8_t             local_state_seq          = 0;
+static uint8_t             local_host_action_seq    = 0;
 static rgb_sync_snapshot_t last_rgb_snapshot        = {0};
 
 static uint8_t get_local_mods(void) {
@@ -664,6 +727,30 @@ static void host_sync_send_state(bool rgb_changed, bool sync_rgb_timer, bool is_
     (void)is_reply;
     (void)activity_wake;
     (void)app_changed;
+#endif
+}
+
+static void host_sync_send_action(uint8_t action_id) {
+#ifdef RAW_ENABLE
+    if (!is_keyboard_master()) {
+        return;
+    }
+
+    uint8_t pkt[RAW_EPSIZE];
+    memset(pkt, 0, sizeof(pkt));
+    local_host_action_seq++;
+
+    pkt[0] = RAW_SYNC_CMD_ID;
+    pkt[1] = RAW_SYNC_MAGIC_0;
+    pkt[2] = RAW_SYNC_MAGIC_1;
+    pkt[3] = RAW_MSG_HOST_ACTION;
+    pkt[4] = is_keyboard_left() ? 1 : 0;
+    pkt[5] = action_id;
+    pkt[6] = local_host_action_seq;
+
+    raw_hid_send(pkt, sizeof(pkt));
+#else
+    (void)action_id;
 #endif
 }
 
@@ -896,6 +983,12 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             }
         }
     }
+    if (keycode == HA_HEX_TOGG) {
+        if (record->event.pressed) {
+            host_sync_send_action(HOST_ACTION_HA_HEX_TOGGLE);
+        }
+        return false;
+    }
     return true;
 }
 
@@ -954,6 +1047,93 @@ bool shutdown_user(bool jump_to_bootloader) {
     return true;
 }
 
+#ifdef SOFLE_USB_RECOVERY_ENABLED
+#    define USB_SUSPEND_RECOVER_NO_RWU_MS 300
+#    define USB_SUSPEND_RECOVER_RWU_MS    1500
+#    define USB_UNCONFIGURED_RECOVER_MS   3000
+#    define USB_RESTART_COOLDOWN_MS       5000
+
+static bool     suspend_key_was_pressed    = false;
+static bool     suspend_wake_attempt_active = false;
+static uint32_t suspend_wake_attempt_start = 0;
+static bool     usb_unconfigured_active    = false;
+static uint32_t usb_unconfigured_since     = 0;
+static bool     last_usb_restart_valid     = false;
+static uint32_t last_usb_restart_time      = 0;
+
+static bool is_local_input_pressed(void) {
+    if (!gpio_read_pin(USR_BTN_PIN)) {
+        return true;
+    }
+    uint8_t row_offset = is_keyboard_left() ? 0 : 5;
+    for (uint8_t r = 0; r < 5; r++) {
+        if ((matrix_get_row((uint8_t)(r + row_offset)) & 0x3F) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool sofle_usb_can_restart(void) {
+    return !last_usb_restart_valid || timer_elapsed32(last_usb_restart_time) >= USB_RESTART_COOLDOWN_MS;
+}
+
+static void sofle_usb_trigger_restart(void) {
+    suspend_wake_attempt_active = false;
+    usb_unconfigured_active     = false;
+    last_usb_restart_valid      = true;
+    last_usb_restart_time       = timer_read32();
+    sofle_usb_restart();
+}
+#endif
+
+void suspend_power_down_user(void) {
+    if (!is_keyboard_master() || bootloader_pending) {
+        return;
+    }
+#ifdef SOFLE_USB_RECOVERY_ENABLED
+    sofle_usb_arm_sof_wakeup();
+    bool pressed = is_local_input_pressed();
+    if (pressed && !suspend_key_was_pressed && !suspend_wake_attempt_active) {
+        suspend_wake_attempt_active = true;
+        suspend_wake_attempt_start  = timer_read32();
+    }
+    suspend_key_was_pressed = pressed;
+
+    if (suspend_wake_attempt_active && USB_STATE_IS_SUSPENDED()) {
+        uint32_t delay_ms = USB_REMOTE_WAKEUP_ENABLED() ? USB_SUSPEND_RECOVER_RWU_MS : USB_SUSPEND_RECOVER_NO_RWU_MS;
+        if (timer_elapsed32(suspend_wake_attempt_start) >= delay_ms && sofle_usb_can_restart()) {
+            sofle_usb_trigger_restart();
+        }
+    }
+#endif
+}
+
+void suspend_wakeup_init_user(void) {
+#ifdef SOFLE_USB_RECOVERY_ENABLED
+    suspend_wake_attempt_active = false;
+    suspend_key_was_pressed     = false;
+    usb_unconfigured_active     = false;
+    sofle_usb_rearm_raw_out();
+#endif
+    if (!lights_disabled) {
+        wake_local_displays_and_rgb();
+    }
+}
+
+void notify_usb_device_state_change_user(struct usb_device_state state) {
+    if (state.configure_state == USB_DEVICE_STATE_CONFIGURED) {
+#ifdef SOFLE_USB_RECOVERY_ENABLED
+        suspend_wake_attempt_active = false;
+        suspend_key_was_pressed     = false;
+        usb_unconfigured_active     = false;
+#endif
+        if (!lights_disabled) {
+            wake_local_displays_and_rgb();
+        }
+    }
+}
+
 void housekeeping_task_user(void) {
     if (is_keyboard_master()) {
         if (bootloader_pending && timer_elapsed32(bootloader_req_time) >= RAW_BOOTLOADER_DELAY_MS) {
@@ -963,6 +1143,26 @@ void housekeeping_task_user(void) {
             reset_keyboard();
             return;
         }
+#ifdef SOFLE_USB_RECOVERY_ENABLED
+        suspend_wake_attempt_active = false;
+        suspend_key_was_pressed     = false;
+        if (USB_STATE_IS_ACTIVE()) {
+            usb_unconfigured_active = false;
+#    ifdef RGB_MATRIX_ENABLE
+            if (!lights_disabled && rgb_matrix_get_suspend_state()) {
+                wake_local_displays_and_rgb();
+            }
+#    endif
+        } else if (!USB_STATE_IS_SUSPENDED() && !bootloader_pending) {
+            if (!usb_unconfigured_active) {
+                usb_unconfigured_active = true;
+                usb_unconfigured_since  = timer_read32();
+            } else if (timer_elapsed32(usb_unconfigured_since) >= USB_UNCONFIGURED_RECOVER_MS && sofle_usb_can_restart()) {
+                sofle_usb_trigger_restart();
+                return;
+            }
+        }
+#endif
         bool trrs_connected = is_transport_connected();
         if (trrs_connected) {
             clear_host_sync_state();
@@ -1578,6 +1778,7 @@ static void format_keycode_label(uint16_t kc, bool shift, bool caps, char out[4]
         case RM_VALD: out[0] = 'B'; out[1] = '-'; return;
         case RM_SPDU: out[0] = 'P'; out[1] = '+'; return;
         case RM_SPDD: out[0] = 'P'; out[1] = '-'; return;
+        case HA_HEX_TOGG: out[0] = 'H'; out[1] = 'X'; return;
         case QK_BOOT: out[0] = 'B'; out[1] = 'T'; return;
         case QK_RBT:  out[0] = 'R'; out[1] = 'B'; return;
         case EE_CLR:  out[0] = 'E'; out[1] = 'E'; return;

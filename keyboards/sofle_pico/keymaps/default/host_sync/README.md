@@ -73,3 +73,49 @@ When both halves are plugged in via USB, you can update both boards sequentially
 
 3. Run silently in the background on login:
    - Press `Win + R`, run `shell:startup`, and create a shortcut pointing to `sofle_sync_windows.vbs` (or configure a Task Scheduler task running `pythonw.exe <path>\sofle_sync.py` at logon).
+
+---
+
+## Home Assistant Hex Lights (`_ADJUST + F`)
+
+Pressing the Left home-row index key (`F`, OLED label `HX`) while `_ADJUST` is active (either by holding `LOWER + RAISE` or while in RGB Info OLED mode) sends a Raw HID host action packet (`RAW_MSG_HOST_ACTION = 0x05`, action `1`) over USB to `sofle_sync.py`, which fires an asynchronous `POST` request to `https://home-assistant.zuul-diphda.ts.net/` without blocking key syncing. This works in both Dual-USB mode and TRRS mode whenever `sofle_sync.py` is running on the host connected to the master half.
+
+### 1. Add a Webhook trigger to `automation.toggle_hex_lights`
+
+In Home Assistant (`Settings -> Automations & scenes -> toggle_hex_lights`):
+
+1. Keep your existing toggle action for `light.h6061`.
+2. Add a trigger: **Add trigger -> Other triggers -> Webhook**.
+3. Set **Webhook ID** to `toggle_hex_lights` (or copy the generated ID into a local gitignored `ha_config.json` — see below).
+4. Click the gear icon next to the Webhook trigger:
+   - Ensure **`POST`** is enabled.
+   - **Uncheck** *"Only accessible from the local network"* if Home Assistant receives requests through Tailscale (`100.64.0.0/10`), then click **Save**.
+
+### 2. Local config & overrides (never committed)
+
+Copy `ha_config.example.json` to `ha_config.json` (gitignored via `host_sync/.gitignore`) if you want a custom webhook ID or REST API fallback:
+
+```json
+{
+  "base_url": "https://home-assistant.zuul-diphda.ts.net",
+  "webhook_id": "toggle_hex_lights",
+  "entity_id": "light.h6061",
+  "timeout_s": 5.0
+}
+```
+
+- **REST API fallback (optional)**: set `"webhook_id": ""` and `"token": "<Long-Lived Access Token>"` (with `"entity_id": "light.h6061"` or `"automation.toggle_hex_lights"`) in `ha_config.json` to call Home Assistant's REST `/api/services/...` endpoint instead of a webhook.
+- **Environment variables**: `SOFLE_HA_CONFIG`, `SOFLE_HA_URL`, `SOFLE_HA_WEBHOOK_ID`, `SOFLE_HA_TOKEN`, `SOFLE_HA_ENTITY_ID`, `SOFLE_HA_TIMEOUT`.
+- **CLI flags**: `--ha-config`, `--ha-url`, `--ha-webhook-id`.
+
+### 3. Test from the command line
+
+Verify connectivity from your PC before or after flashing:
+
+```bash
+python3 keyboards/sofle_pico/keymaps/default/host_sync/sofle_sync.py --test-hex-toggle --verbose
+```
+
+```powershell
+python.exe keyboards\sofle_pico\keymaps\default\host_sync\sofle_sync.py --test-hex-toggle --verbose
+```

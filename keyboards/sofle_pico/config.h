@@ -37,3 +37,8 @@
 /* Per-mode RGB Matrix preset storage (4B magic + 4B valid mask + 32 x 4B HSV/speed slots) */
 #define EECONFIG_USER_DATA_SIZE 136
 #define EECONFIG_USER_DATA_VERSION 0x52503031UL
+
+/* Stabilize USB hub/host resume transitions and recover if a half boots during PC sleep */
+#define USB_SUSPEND_WAKEUP_DELAY 200
+#define SPLIT_WATCHDOG_ENABLE
+#define SPLIT_WATCHDOG_TIMEOUT 3000
