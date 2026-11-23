@@ -78,7 +78,7 @@ When both halves are plugged in via USB, you can update both boards sequentially
 
 ## Home Assistant Hex Lights (`_ADJUST + F`)
 
-Pressing the Left home-row index key (`F`, OLED label `HX`) while `_ADJUST` is active (either by holding `LOWER + RAISE` or while in RGB Info OLED mode) sends a Raw HID host action packet (`RAW_MSG_HOST_ACTION = 0x05`, action `1`) over USB to `sofle_sync.py`, which fires an asynchronous `POST` request to `https://home-assistant.zuul-diphda.ts.net/` without blocking key syncing. This works in both Dual-USB mode and TRRS mode whenever `sofle_sync.py` is running on the host connected to the master half.
+Pressing the Left home-row index key (`F`, rendered as a light bulb icon on the OLED) while `_ADJUST` is active (either by holding `LOWER + RAISE` or while in RGB Info OLED mode) sends a Raw HID host action packet (`RAW_MSG_HOST_ACTION = 0x05`, action `1`) over USB to `sofle_sync.py`, which fires an asynchronous `POST` request to `https://home-assistant.zuul-diphda.ts.net/` without blocking key syncing. This works in both Dual-USB mode and TRRS mode whenever `sofle_sync.py` is running on the host connected to the master half.
 
 ### 1. Add a Webhook trigger to `automation.toggle_hex_lights`
 
@@ -119,3 +119,38 @@ python3 keyboards/sofle_pico/keymaps/default/host_sync/sofle_sync.py --test-hex-
 ```powershell
 python.exe keyboards\sofle_pico\keymaps\default\host_sync\sofle_sync.py --test-hex-toggle --verbose
 ```
+
+---
+
+## Windows Audio Output Switcher (`_ADJUST + D`)
+
+Pressing the Left home-row middle key (`D`, next to `F`) while `_ADJUST` is active (either by holding `LOWER + RAISE` or while in RGB Info OLED mode) sends `HOST_ACTION_AUDIO_SWAP` (`0x02`) over Raw HID to `sofle_sync.py`. On Windows, `sofle_sync.py` uses pure Python `ctypes` Core Audio COM (`IPolicyConfig` / `IPolicyConfigVista`, zero `pip` packages or console popups) to swap **Default Playback** (`console` + `multimedia`, leaving Default Communications unchanged) between `"Wireless Headset"` and `"Speakers"`. Works in both Dual-USB and TRRS modes whenever `sofle_sync.py` is running on the host connected to the master half.
+
+On the OLED `_ADJUST` screen, `F` renders as a **light bulb** icon and `D` dynamically switches between a **headphones** icon (when Windows is currently on **Speakers**) and a **speaker** icon (when currently on **Wireless Headset**, syncing live via `MSG_HOST_STATUS = 0x06` in both Dual-USB and TRRS modes).
+
+### Verify & inspect devices on Windows
+
+```powershell
+python.exe keyboards\sofle_pico\keymaps\default\host_sync\sofle_sync.py --list-audio-devices
+python.exe keyboards\sofle_pico\keymaps\default\host_sync\sofle_sync.py --test-audio-swap --verbose
+```
+
+### Optional customization
+
+Copy `audio_config.example.json` to `audio_config.json` (gitignored via `host_sync/.gitignore`) to adjust device names or roles:
+
+```json
+{
+  "devices": [
+    "Wireless Headset",
+    "Speakers"
+  ],
+  "roles": [
+    "console",
+    "multimedia"
+  ]
+}
+```
+
+- **Environment variables**: `SOFLE_AUDIO_CONFIG`, `SOFLE_AUDIO_DEVICES` (comma-separated), `SOFLE_AUDIO_ROLES` (comma-separated: `console`, `multimedia`, `communications`).
+- **CLI flags**: `--audio-config`, `--audio-devices "Wireless Headset,Speakers"`, `--audio-include-comms` (also switches Default Communications).

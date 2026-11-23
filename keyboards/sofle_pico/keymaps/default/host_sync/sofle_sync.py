@@ -23,6 +23,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -40,6 +41,12 @@ MSG_IDENTIFY = 0x03
 MSG_BOOTLOADER = 0x04
 MSG_HOST_ACTION = 0x05
 HOST_ACTION_HA_HEX_TOGGLE = 0x01
+HOST_ACTION_AUDIO_SWAP = 0x02
+MSG_HOST_STATUS = 0x06
+HOST_AUDIO_UNKNOWN = 0
+HOST_AUDIO_HEADSET = 1
+HOST_AUDIO_SPEAKER = 2
+AUDIO_POLL_INTERVAL_S = 2.0
 BOOTLOADER_MAGIC = b"BOOT"
 
 DEFAULT_HA_URL = "https://home-assistant.zuul-diphda.ts.net"
@@ -47,6 +54,16 @@ DEFAULT_HA_WEBHOOK_ID = "toggle_hex_lights"
 DEFAULT_HA_ENTITY_ID = "light.h6061"
 DEFAULT_HA_TIMEOUT_S = 5.0
 DEFAULT_HA_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ha_config.json")
+
+DEFAULT_AUDIO_DEVICES = ("Wireless Headset", "Speakers")
+DEFAULT_AUDIO_ROLES = ("console", "multimedia")
+DEFAULT_AUDIO_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_config.json")
+
+AUDIO_ROLE_MAP: Dict[str, int] = {
+    "console": 0,         # eConsole (Default Device)
+    "multimedia": 1,      # eMultimedia (Default Device)
+    "communications": 2,  # eCommunications (Default Communications Device)
+}
 
 RESCAN_INTERVAL_S = 1.5
 PING_INTERVAL_S = 0.75
@@ -65,6 +82,16 @@ def build_ping_packet(
     pkt[4] = 1 if peer_connected else 0
     pkt[5] = 1 if request_state else 0
     pkt[6] = 1 if request_rgb_authoritative else 0
+    return bytes(pkt)
+
+
+def build_host_status_packet(audio_state: int) -> bytes:
+    """Build a 32-byte MSG_HOST_STATUS report pushed from host daemon to keyboard halves."""
+    pkt = bytearray(RAW_EPSIZE)
+    pkt[0] = CMD_SYNC
+    pkt[1:3] = MAGIC
+    pkt[3] = MSG_HOST_STATUS
+    pkt[4] = audio_state & 0xFF
     return bytes(pkt)
 
 
@@ -315,6 +342,400 @@ class HomeAssistantActionDispatcher:
         t.start()
 
 
+@dataclass(frozen=True)
+class AudioEndpoint:
+    device_id: str
+    friendly_name: str
+    device_desc: str = ""
+
+
+@dataclass(frozen=True)
+class AudioSwapConfig:
+    devices: Tuple[str, ...] = DEFAULT_AUDIO_DEVICES
+    roles: Tuple[str, ...] = DEFAULT_AUDIO_ROLES
+
+
+def _parse_audio_csv(raw_val: str) -> Tuple[str, ...]:
+    return tuple(item.strip() for item in raw_val.split(",") if item.strip())
+
+
+def _normalize_audio_roles(raw_roles: object) -> Tuple[str, ...]:
+    if isinstance(raw_roles, str):
+        items = _parse_audio_csv(raw_roles)
+    elif isinstance(raw_roles, (list, tuple)):
+        items = tuple(str(x).strip() for x in raw_roles if str(x).strip())
+    else:
+        return DEFAULT_AUDIO_ROLES
+    normalized: List[str] = []
+    seen = set()
+    for item in items:
+        key = item.lower()
+        if key in AUDIO_ROLE_MAP and key not in seen:
+            normalized.append(key)
+            seen.add(key)
+    return tuple(normalized) if normalized else DEFAULT_AUDIO_ROLES
+
+
+def load_audio_config(
+    config_path: Optional[str] = None,
+    cli_devices: Optional[str] = None,
+    include_comms: bool = False,
+    env: Optional[Dict[str, str]] = None,
+) -> AudioSwapConfig:
+    """Load Windows audio switcher settings from defaults, JSON file, env vars, and CLI flags."""
+    env_map: Dict[str, str] = os.environ if env is None else env  # type: ignore[assignment]
+    path = config_path or env_map.get("SOFLE_AUDIO_CONFIG") or DEFAULT_AUDIO_CONFIG_PATH
+
+    devices: Tuple[str, ...] = DEFAULT_AUDIO_DEVICES
+    roles: Tuple[str, ...] = DEFAULT_AUDIO_ROLES
+
+    if path and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+            if isinstance(raw_cfg, dict):
+                if "devices" in raw_cfg and raw_cfg["devices"] is not None:
+                    raw_devs = raw_cfg["devices"]
+                    if isinstance(raw_devs, list):
+                        parsed_devs = tuple(str(d).strip() for d in raw_devs if str(d).strip())
+                    elif isinstance(raw_devs, str):
+                        parsed_devs = _parse_audio_csv(raw_devs)
+                    else:
+                        parsed_devs = ()
+                    if parsed_devs:
+                        devices = parsed_devs
+                if "roles" in raw_cfg and raw_cfg["roles"] is not None:
+                    roles = _normalize_audio_roles(raw_cfg["roles"])
+            else:
+                print(
+                    f"[sofle-sync] Ignoring non-object audio config in {path}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"[sofle-sync] Failed to read audio config {path}: {exc}", file=sys.stderr, flush=True)
+
+    if "SOFLE_AUDIO_DEVICES" in env_map:
+        parsed_env_devs = _parse_audio_csv(env_map["SOFLE_AUDIO_DEVICES"])
+        if parsed_env_devs:
+            devices = parsed_env_devs
+    if "SOFLE_AUDIO_ROLES" in env_map:
+        roles = _normalize_audio_roles(env_map["SOFLE_AUDIO_ROLES"])
+
+    if cli_devices is not None:
+        parsed_cli_devs = _parse_audio_csv(cli_devices)
+        if parsed_cli_devs:
+            devices = parsed_cli_devs
+
+    if include_comms and "communications" not in roles:
+        roles = roles + ("communications",)
+
+    return AudioSwapConfig(devices=devices, roles=roles)
+
+
+def match_audio_endpoint(
+    target: str,
+    endpoints: List[AudioEndpoint],
+    exclude_ids: Optional[set] = None,
+) -> Optional[AudioEndpoint]:
+    """Match a target name/ID against active endpoints by exact > prefix ('Name' or 'Name (...)') > substring."""
+    needle = target.strip().casefold()
+    if not needle:
+        return None
+    excluded = exclude_ids or set()
+
+    def score_endpoint(ep: AudioEndpoint) -> Optional[Tuple[int, int]]:
+        dev_id = ep.device_id.strip().casefold()
+        fname = ep.friendly_name.strip().casefold()
+        desc = ep.device_desc.strip().casefold()
+
+        tier: Optional[int] = None
+        if needle == dev_id or needle == fname or (desc and needle == desc):
+            tier = 0
+        elif fname.startswith(needle) and (
+            len(fname) == len(needle) or fname[len(needle)] in (" ", "(")
+        ):
+            tier = 1
+        elif needle in fname or (desc and needle in desc):
+            tier = 2
+
+        if tier is None:
+            return None
+        is_excluded = 1 if ep.device_id in excluded else 0
+        return (tier, is_excluded)
+
+    best_ep: Optional[AudioEndpoint] = None
+    best_score: Optional[Tuple[int, int]] = None
+    for ep in endpoints:
+        sc = score_endpoint(ep)
+        if sc is not None and (best_score is None or sc < best_score):
+            best_score = sc
+            best_ep = ep
+    return best_ep
+
+
+def choose_next_audio_endpoint(
+    endpoints: List[AudioEndpoint],
+    current_default_id: Optional[str],
+    targets: Tuple[str, ...],
+) -> Tuple[Optional[AudioEndpoint], List[str]]:
+    """Resolve target devices and return (next_endpoint_to_select, missing_targets)."""
+    resolved: List[AudioEndpoint] = []
+    seen_ids = set()
+    missing_targets: List[str] = []
+
+    for target in targets:
+        ep = match_audio_endpoint(target, endpoints, exclude_ids=seen_ids)
+        if ep is None:
+            missing_targets.append(target)
+            continue
+        if ep.device_id not in seen_ids:
+            resolved.append(ep)
+            seen_ids.add(ep.device_id)
+
+    if not resolved:
+        return None, missing_targets
+
+    if current_default_id:
+        for i, ep in enumerate(resolved):
+            if ep.device_id == current_default_id:
+                nxt = resolved[(i + 1) % len(resolved)]
+                if nxt.device_id == ep.device_id:
+                    return None, missing_targets
+                return nxt, missing_targets
+
+    return resolved[0], missing_targets
+
+
+_HEADSET_KEYWORDS = ("headset", "headphone", "earphone", "earbud", "airpod", "buds")
+_SPEAKER_KEYWORDS = ("speaker", "monitor", "hdmi", "display", "soundbar")
+
+
+def classify_audio_device_name(name: str) -> int:
+    """Classify an audio endpoint name/target as Headset (1), Speaker (2), or Unknown (0)."""
+    low = name.strip().casefold()
+    if not low:
+        return HOST_AUDIO_UNKNOWN
+    if any(kw in low for kw in _HEADSET_KEYWORDS):
+        return HOST_AUDIO_HEADSET
+    if any(kw in low for kw in _SPEAKER_KEYWORDS):
+        return HOST_AUDIO_SPEAKER
+    return HOST_AUDIO_UNKNOWN
+
+
+def detect_audio_output_state(
+    endpoints: List[AudioEndpoint],
+    current_default_id: Optional[str],
+    targets: Tuple[str, ...],
+) -> int:
+    """Determine HOST_AUDIO_* for the current Windows default playback endpoint."""
+    if not current_default_id:
+        return HOST_AUDIO_UNKNOWN
+
+    seen_ids = set()
+    for idx, target in enumerate(targets):
+        ep = match_audio_endpoint(target, endpoints, exclude_ids=seen_ids)
+        if ep is None:
+            continue
+        seen_ids.add(ep.device_id)
+        if ep.device_id == current_default_id:
+            state = classify_audio_device_name(target)
+            if state == HOST_AUDIO_UNKNOWN:
+                state = classify_audio_device_name(ep.friendly_name)
+            if state == HOST_AUDIO_UNKNOWN and ep.device_desc:
+                state = classify_audio_device_name(ep.device_desc)
+            if state == HOST_AUDIO_UNKNOWN:
+                state = HOST_AUDIO_HEADSET if (idx % 2 == 0) else HOST_AUDIO_SPEAKER
+            return state
+
+    for ep in endpoints:
+        if ep.device_id == current_default_id:
+            state = classify_audio_device_name(ep.friendly_name)
+            if state == HOST_AUDIO_UNKNOWN and ep.device_desc:
+                state = classify_audio_device_name(ep.device_desc)
+            return state
+
+    return HOST_AUDIO_UNKNOWN
+
+
+_UNSET_BACKEND = object()
+
+
+class AudioSwapDispatcher:
+    """Swaps Windows default playback output endpoints asynchronously without external dependencies."""
+
+    def __init__(
+        self,
+        config_path: Optional[str] = None,
+        cli_devices: Optional[str] = None,
+        include_comms: bool = False,
+        verbose: bool = False,
+        backend: object = _UNSET_BACKEND,
+        on_state_change: Optional[Callable[[int], None]] = None,
+        max_inflight: int = 2,
+    ) -> None:
+        self.config_path = config_path
+        self.cli_devices = cli_devices
+        self.include_comms = include_comms
+        self.verbose = verbose
+        self.on_state_change = on_state_change
+        if backend is _UNSET_BACKEND:
+            self._backend = WindowsCoreAudioBackend() if sys.platform == "win32" else None
+        else:
+            self._backend = backend
+        self._swap_lock = threading.Lock()
+        self._inflight = threading.Semaphore(max(1, max_inflight))
+        self._monitor_started = False
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"[sofle-sync] {msg}", flush=True)
+
+    def set_state_callback(self, cb: Optional[Callable[[int], None]]) -> None:
+        self.on_state_change = cb
+
+    def list_devices(self) -> Tuple[List[AudioEndpoint], Optional[str], Optional[str]]:
+        if self._backend is None:
+            raise OSError("Windows audio device switching is only supported when sofle_sync.py runs on Windows")
+        endpoints = self._backend.list_active_render_endpoints()  # type: ignore[attr-defined]
+        def_console = self._backend.get_default_render_endpoint_id(role=0)  # type: ignore[attr-defined]
+        def_comms = self._backend.get_default_render_endpoint_id(role=2)  # type: ignore[attr-defined]
+        return endpoints, def_console, def_comms
+
+    def detect_current_state(self) -> int:
+        if self._backend is None:
+            return HOST_AUDIO_UNKNOWN
+        cfg = load_audio_config(
+            config_path=self.config_path,
+            cli_devices=self.cli_devices,
+            include_comms=self.include_comms,
+        )
+        role_ints = tuple(AUDIO_ROLE_MAP[r] for r in cfg.roles if r in AUDIO_ROLE_MAP) or (0, 1)
+        with self._swap_lock:
+            try:
+                endpoints = self._backend.list_active_render_endpoints()  # type: ignore[attr-defined]
+                cur_default = self._backend.get_default_render_endpoint_id(role=role_ints[0])  # type: ignore[attr-defined]
+                if not cur_default and role_ints[0] != 1:
+                    cur_default = self._backend.get_default_render_endpoint_id(role=1)  # type: ignore[attr-defined]
+                return detect_audio_output_state(endpoints, cur_default, cfg.devices)
+            except OSError:
+                return HOST_AUDIO_UNKNOWN
+
+    def swap_audio_output(self, side: str = "cli") -> bool:
+        if self._backend is None:
+            print(
+                "[sofle-sync] Windows audio output swap skipped: host is not running on Windows",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+
+        cfg = load_audio_config(
+            config_path=self.config_path,
+            cli_devices=self.cli_devices,
+            include_comms=self.include_comms,
+        )
+        role_ints = tuple(AUDIO_ROLE_MAP[r] for r in cfg.roles if r in AUDIO_ROLE_MAP) or (0, 1)
+
+        new_state: Optional[int] = None
+        with self._swap_lock:
+            try:
+                endpoints = self._backend.list_active_render_endpoints()  # type: ignore[attr-defined]
+                cur_default = self._backend.get_default_render_endpoint_id(role=role_ints[0])  # type: ignore[attr-defined]
+                if not cur_default and role_ints[0] != 1:
+                    cur_default = self._backend.get_default_render_endpoint_id(role=1)  # type: ignore[attr-defined]
+                target, missing = choose_next_audio_endpoint(endpoints, cur_default, cfg.devices)
+                if target is None:
+                    avail = ", ".join(ep.friendly_name for ep in endpoints) or "(none)"
+                    miss_s = f"Missing: {', '.join(missing)}; " if missing else ""
+                    print(
+                        f"[sofle-sync] Audio swap target unavailable ({miss_s}active outputs: {avail})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return False
+
+                self._backend.set_default_endpoint(target.device_id, role_ints)  # type: ignore[attr-defined]
+                self._log(f"Swapped Windows audio output ({side}) -> {target.friendly_name}")
+                new_state = detect_audio_output_state(endpoints, target.device_id, cfg.devices)
+            except OSError as exc:
+                print(f"[sofle-sync] Windows audio swap failed ({side}): {exc}", file=sys.stderr, flush=True)
+                return False
+
+        if new_state is not None:
+            cb = self.on_state_change
+            if cb is not None:
+                cb(new_state)
+        return True
+
+    def start_state_monitor(self, interval_s: float = AUDIO_POLL_INTERVAL_S) -> None:
+        if self._backend is None or self.on_state_change is None or self._monitor_started:
+            return
+        self._monitor_started = True
+        poll_s = max(0.5, float(interval_s))
+
+        def monitor_loop() -> None:
+            last_state: Optional[int] = None
+            while True:
+                try:
+                    cur_state = self.detect_current_state()
+                    if last_state is None or cur_state != last_state:
+                        last_state = cur_state
+                        cb = self.on_state_change
+                        if cb is not None:
+                            cb(cur_state)
+                except Exception as exc:
+                    self._log(f"Audio monitor loop error: {exc}")
+                time.sleep(poll_s)
+
+        t = threading.Thread(target=monitor_loop, name="sofle-audio-mon", daemon=True)
+        t.start()
+
+    def _run_swap_worker(self, side: str) -> None:
+        try:
+            self.swap_audio_output(side=side)
+        finally:
+            self._inflight.release()
+
+    def dispatch_async(self, side: str, seq: int) -> None:
+        if not self._inflight.acquire(blocking=False):
+            print(
+                f"[sofle-sync] Dropping audio swap from {side} (seq={seq}): swap already queued",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        t = threading.Thread(
+            target=self._run_swap_worker,
+            args=(side,),
+            name=f"sofle-audio-{seq}",
+            daemon=True,
+        )
+        t.start()
+
+
+class HostActionRouter:
+    """Dispatches Raw HID host actions cleanly by action ID."""
+
+    def __init__(
+        self,
+        ha_dispatcher: HomeAssistantActionDispatcher,
+        audio_dispatcher: AudioSwapDispatcher,
+        verbose: bool = False,
+    ) -> None:
+        self.ha_dispatcher = ha_dispatcher
+        self.audio_dispatcher = audio_dispatcher
+        self.verbose = verbose
+
+    def dispatch_async(self, side: str, action_id: int, seq: int) -> None:
+        if action_id == HOST_ACTION_HA_HEX_TOGGLE:
+            self.ha_dispatcher.dispatch_async(side, action_id, seq)
+        elif action_id == HOST_ACTION_AUDIO_SWAP:
+            self.audio_dispatcher.dispatch_async(side, seq)
+        elif self.verbose:
+            print(f"[sofle-sync] Ignoring unknown host action id={action_id} from {side} (seq={seq})", flush=True)
+
+
 def is_qmk_raw_hid_descriptor(desc: bytes) -> bool:
     """
     Parse short items of a USB HID report descriptor to detect the top-level
@@ -373,6 +794,7 @@ class BridgeCoordinator:
         self.roles: Dict[str, Optional[str]] = {"left": None, "right": None}
         self.paired = False
         self.last_ping = 0.0
+        self.host_audio_state: int = HOST_AUDIO_UNKNOWN
 
     def _log(self, msg: str) -> None:
         if self.verbose:
@@ -385,19 +807,39 @@ class BridgeCoordinator:
         try:
             dev.write_report(payload)  # type: ignore[attr-defined]
             return True
-        except OSError:
+        except OSError as exc:
+            self._log(f"Write failed on {key}: {exc}")
             self.unregister_device(key)
             return False
 
-    def register_device(self, key: str, dev: object) -> None:
+    def register_device(self, key: str, dev: object) -> bool:
         with self.lock:
             self.devices[key] = dev
             self.sides[key] = None
             self._log(f"Connected {key}, probing side...")
-            self._send(key, build_ping_packet(peer_connected=False, request_state=True))
+            if not self._send(key, build_ping_packet(peer_connected=False, request_state=True)):
+                return False
+            if self.host_audio_state != HOST_AUDIO_UNKNOWN:
+                if not self._send(key, build_host_status_packet(self.host_audio_state)):
+                    return False
+            return key in self.devices
+
+    def set_host_audio_state(self, state: int, force: bool = False) -> None:
+        if state not in (HOST_AUDIO_UNKNOWN, HOST_AUDIO_HEADSET, HOST_AUDIO_SPEAKER):
+            state = HOST_AUDIO_UNKNOWN
+        with self.lock:
+            if not force and state == self.host_audio_state:
+                return
+            self.host_audio_state = state
+            pkt = build_host_status_packet(state)
+            for key in list(self.devices.keys()):
+                self._send(key, pkt)
 
     def unregister_device(self, key: str) -> None:
         with self.lock:
+            in_roles = any(r == key for r in self.roles.values())
+            if key not in self.devices and key not in self.sides and not in_roles:
+                return
             dev = self.devices.pop(key, None)
             side = self.sides.pop(key, None)
             if dev is not None:
@@ -408,6 +850,9 @@ class BridgeCoordinator:
             was_paired = self.paired
             if side in ("left", "right") and self.roles.get(side) == key:
                 self.roles[side] = None
+            for r_side in ("left", "right"):
+                if self.roles.get(r_side) == key:
+                    self.roles[r_side] = None
             self.paired = self.roles["left"] is not None and self.roles["right"] is not None
             self._log(f"Disconnected {key} (side={side})")
             if was_paired and not self.paired:
@@ -453,17 +898,20 @@ class BridgeCoordinator:
             if peer_key is not None and peer_key != src_key:
                 self._send(peer_key, payload)
 
-            if newly_paired:
-                self._log("Both halves paired! Syncing initial RGB (Right -> Left) and layer/mod states.")
-                assert self.roles["right"] is not None and self.roles["left"] is not None
-                self._send(
-                    self.roles["right"],
-                    build_ping_packet(peer_connected=True, request_state=True, request_rgb_authoritative=True),
-                )
-                self._send(
-                    self.roles["left"],
-                    build_ping_packet(peer_connected=True, request_state=True, request_rgb_authoritative=False),
-                )
+            if newly_paired and self.paired:
+                right_key = self.roles["right"]
+                left_key = self.roles["left"]
+                if right_key is not None and left_key is not None:
+                    self._log("Both halves paired! Syncing initial RGB (Right -> Left) and layer/mod states.")
+                    self._send(
+                        right_key,
+                        build_ping_packet(peer_connected=True, request_state=True, request_rgb_authoritative=True),
+                    )
+                    if self.paired and self.roles["left"] == left_key:
+                        self._send(
+                            left_key,
+                            build_ping_packet(peer_connected=True, request_state=True, request_rgb_authoritative=False),
+                        )
 
     def tick_pings(self, now: Optional[float] = None) -> None:
         if now is None:
@@ -556,23 +1004,63 @@ def discover_linux_hidraw_paths(sysfs_glob: str = "/sys/class/hidraw/hidraw*") -
     return paths
 
 
+def _prune_probe_backoff(
+    fail_counts: Dict[str, int],
+    retry_after: Dict[str, float],
+    active_keys: set,
+) -> None:
+    """Drop per-path probe backoff state once a device disappears."""
+    for stale in list(fail_counts.keys()):
+        if stale not in active_keys:
+            fail_counts.pop(stale, None)
+            retry_after.pop(stale, None)
+
+
+def _record_probe_failure(
+    fail_counts: Dict[str, int],
+    retry_after: Dict[str, float],
+    key: str,
+    now: float,
+) -> None:
+    """Apply bounded linear backoff when opening or probing a device fails."""
+    count = fail_counts.get(key, 0) + 1
+    fail_counts[key] = count
+    retry_after[key] = now + min(5.0, 2.0 * count)
+
+
+def _clear_probe_backoff(fail_counts: Dict[str, int], retry_after: Dict[str, float], key: str) -> None:
+    fail_counts.pop(key, None)
+    retry_after.pop(key, None)
+
+
 def run_linux_hidraw(coord: BridgeCoordinator) -> None:
     open_devs: Dict[str, LinuxHidrawDevice] = {}
+    fail_counts: Dict[str, int] = {}
+    retry_after: Dict[str, float] = {}
     last_scan = 0.0
 
     def rescan(now: float) -> None:
         nonlocal last_scan
         last_scan = now
         found = set(discover_linux_hidraw_paths())
+        _prune_probe_backoff(fail_counts, retry_after, found)
         for path in sorted(found):
-            if path not in open_devs:
-                try:
-                    fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
-                    dev = LinuxHidrawDevice(key=path, dev_path=path, fd=fd)
-                    open_devs[path] = dev
-                    coord.register_device(path, dev)
-                except OSError as exc:
-                    coord._log(f"Cannot open {path}: {exc}")
+            if path in open_devs or now < retry_after.get(path, 0.0):
+                continue
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+                dev = LinuxHidrawDevice(key=path, dev_path=path, fd=fd)
+            except OSError as exc:
+                _record_probe_failure(fail_counts, retry_after, path, now)
+                coord._log(f"Cannot open {path}: {exc}")
+                continue
+            open_devs[path] = dev
+            if not coord.register_device(path, dev):
+                open_devs.pop(path, None)
+                dev.close()
+                _record_probe_failure(fail_counts, retry_after, path, now)
+                continue
+            _clear_probe_backoff(fail_counts, retry_after, path)
 
     while True:
         now = time.monotonic()
@@ -634,6 +1122,245 @@ class Win32GUID(ctypes.Structure):
         ("Data3", ctypes.c_uint16),
         ("Data4", ctypes.c_ubyte * 8),
     ]
+
+
+def make_win32_guid(guid_str: str) -> Win32GUID:
+    """Convert a standard GUID string into a Win32GUID ctypes struct."""
+    u = uuid.UUID(guid_str)
+    return Win32GUID(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:16]))
+
+
+class Win32PROPERTYKEY(ctypes.Structure):
+    _fields_ = [
+        ("fmtid", Win32GUID),
+        ("pid", ctypes.c_uint32),
+    ]
+
+
+class Win32PROPVARIANT(ctypes.Structure):
+    _fields_ = [
+        ("vt", ctypes.c_uint16),
+        ("wReserved1", ctypes.c_uint16),
+        ("wReserved2", ctypes.c_uint16),
+        ("wReserved3", ctypes.c_uint16),
+        ("pwszVal", ctypes.c_void_p),
+        ("_pad", ctypes.c_void_p),
+    ]
+
+
+CLSID_MMDeviceEnumerator = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+IID_IMMDeviceEnumerator = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+CLSID_CPolicyConfigClient = "{870AF99C-171D-4F9E-AF0D-E63DF40C2BC9}"
+IID_IPolicyConfig = "{F8679F50-850A-41CF-9C72-430F290290C8}"
+CLSID_CPolicyConfigVistaClient = "{294935CE-F637-4E7C-A41B-AB255460B862}"
+IID_IPolicyConfigVista = "{568B9108-44BF-40B4-9006-86AFE5B5A620}"
+FMTID_DeviceProperties = "{A45C254E-DF1C-4EFD-8020-67D146A850E0}"
+PID_DEVICE_FRIENDLY_NAME = 14
+PID_DEVICE_DESC = 2
+
+EFLOW_RENDER = 0
+DEVICE_STATE_ACTIVE = 0x00000001
+STGM_READ = 0
+VT_LPWSTR = 31
+CLSCTX_ALL = 0x17
+COINIT_MULTITHREADED = 0x0
+COINIT_APARTMENTTHREADED = 0x2
+COM_S_OK = 0
+COM_S_FALSE = 1
+COM_RPC_E_CHANGED_MODE = -2147417850
+
+
+class WindowsCoreAudioBackend:
+    """Pure-ctypes Windows Core Audio COM endpoint enumerator and switcher."""
+
+    @staticmethod
+    def _load_ole32():
+        ole32 = ctypes.WinDLL("ole32")  # type: ignore[attr-defined]
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        ole32.CoInitializeEx.restype = ctypes.c_int32
+        ole32.CoUninitialize.argtypes = []
+        ole32.CoUninitialize.restype = None
+        ole32.CoCreateInstance.argtypes = [
+            ctypes.POINTER(Win32GUID),
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(Win32GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        ole32.CoCreateInstance.restype = ctypes.c_int32
+        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+        ole32.CoTaskMemFree.restype = None
+        ole32.PropVariantClear.argtypes = [ctypes.POINTER(Win32PROPVARIANT)]
+        ole32.PropVariantClear.restype = ctypes.c_int32
+        return ole32
+
+    @staticmethod
+    def _com_call(iface_ptr: ctypes.c_void_p, slot: int, proto, *args):
+        vtable = ctypes.cast(iface_ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        fn = proto(vtable[slot])
+        return fn(iface_ptr, *args)
+
+    @classmethod
+    def _com_release(cls, iface_ptr: Optional[ctypes.c_void_p]) -> None:
+        if iface_ptr and iface_ptr.value:
+            release_proto = ctypes.WINFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)  # type: ignore[attr-defined]
+            cls._com_call(iface_ptr, 2, release_proto)
+
+    def _with_com(self, fn):
+        ole32 = self._load_ole32()
+        hr = ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
+        should_uninit = hr in (COM_S_OK, COM_S_FALSE)
+        if hr < 0 and hr != COM_RPC_E_CHANGED_MODE:
+            raise OSError(f"CoInitializeEx failed with HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+        try:
+            return fn(ole32)
+        finally:
+            if should_uninit:
+                ole32.CoUninitialize()
+
+    @staticmethod
+    def _co_create(ole32, clsid_str: str, iid_str: str) -> ctypes.c_void_p:
+        clsid = make_win32_guid(clsid_str)
+        iid = make_win32_guid(iid_str)
+        ptr = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(ctypes.byref(clsid), None, CLSCTX_ALL, ctypes.byref(iid), ctypes.byref(ptr))
+        if hr < 0 or not ptr.value:
+            raise OSError(f"CoCreateInstance({clsid_str}) failed with HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+        return ptr
+
+    @classmethod
+    def _read_device_id(cls, ole32, p_dev: ctypes.c_void_p) -> Optional[str]:
+        get_id_proto = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+            ctypes.c_int32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)
+        )
+        id_ptr = ctypes.c_void_p()
+        try:
+            hr = cls._com_call(p_dev, 5, get_id_proto, ctypes.byref(id_ptr))
+            if hr < 0 or not id_ptr.value:
+                return None
+            return ctypes.wstring_at(id_ptr.value)
+        finally:
+            if id_ptr.value:
+                ole32.CoTaskMemFree(id_ptr.value)
+
+    @classmethod
+    def _read_prop_string(cls, ole32, p_store: ctypes.c_void_p, pkey: Win32PROPERTYKEY) -> str:
+        get_val_proto = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+            ctypes.c_int32, ctypes.c_void_p, ctypes.POINTER(Win32PROPERTYKEY), ctypes.POINTER(Win32PROPVARIANT)
+        )
+        pv = Win32PROPVARIANT()
+        ctypes.memset(ctypes.byref(pv), 0, ctypes.sizeof(pv))
+        try:
+            hr = cls._com_call(p_store, 5, get_val_proto, ctypes.byref(pkey), ctypes.byref(pv))
+            if hr >= 0 and pv.vt == VT_LPWSTR and pv.pwszVal:
+                return ctypes.wstring_at(pv.pwszVal)
+            return ""
+        finally:
+            ole32.PropVariantClear(ctypes.byref(pv))
+
+    def list_active_render_endpoints(self) -> List[AudioEndpoint]:
+        def work(ole32) -> List[AudioEndpoint]:
+            enum_endpoints_proto = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+                ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)
+            )
+            get_count_proto = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+                ctypes.c_int32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)
+            )
+            item_proto = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+                ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)
+            )
+            open_props_proto = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+                ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)
+            )
+
+            pkey_friendly = Win32PROPERTYKEY(make_win32_guid(FMTID_DeviceProperties), PID_DEVICE_FRIENDLY_NAME)
+            pkey_desc = Win32PROPERTYKEY(make_win32_guid(FMTID_DeviceProperties), PID_DEVICE_DESC)
+
+            results: List[AudioEndpoint] = []
+            p_enum = self._co_create(ole32, CLSID_MMDeviceEnumerator, IID_IMMDeviceEnumerator)
+            p_col = ctypes.c_void_p()
+            try:
+                hr = self._com_call(
+                    p_enum, 3, enum_endpoints_proto, EFLOW_RENDER, DEVICE_STATE_ACTIVE, ctypes.byref(p_col)
+                )
+                if hr < 0 or not p_col.value:
+                    raise OSError(f"EnumAudioEndpoints failed with HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+                count = ctypes.c_uint32(0)
+                hr = self._com_call(p_col, 3, get_count_proto, ctypes.byref(count))
+                if hr < 0:
+                    raise OSError(f"IMMDeviceCollection::GetCount failed with HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+
+                for idx in range(count.value):
+                    p_dev = ctypes.c_void_p()
+                    p_store = ctypes.c_void_p()
+                    try:
+                        hr = self._com_call(p_col, 4, item_proto, idx, ctypes.byref(p_dev))
+                        if hr < 0 or not p_dev.value:
+                            continue
+                        dev_id = self._read_device_id(ole32, p_dev)
+                        if not dev_id:
+                            continue
+                        fname = ""
+                        desc = ""
+                        hr = self._com_call(p_dev, 4, open_props_proto, STGM_READ, ctypes.byref(p_store))
+                        if hr >= 0 and p_store.value:
+                            fname = self._read_prop_string(ole32, p_store, pkey_friendly)
+                            desc = self._read_prop_string(ole32, p_store, pkey_desc)
+                        results.append(
+                            AudioEndpoint(
+                                device_id=dev_id,
+                                friendly_name=fname or desc or dev_id,
+                                device_desc=desc,
+                            )
+                        )
+                    finally:
+                        self._com_release(p_store)
+                        self._com_release(p_dev)
+            finally:
+                self._com_release(p_col)
+                self._com_release(p_enum)
+            return results
+
+        return self._with_com(work)
+
+    def get_default_render_endpoint_id(self, role: int = 0) -> Optional[str]:
+        def work(ole32) -> Optional[str]:
+            get_def_proto = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+                ctypes.c_int32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)
+            )
+            p_enum = self._co_create(ole32, CLSID_MMDeviceEnumerator, IID_IMMDeviceEnumerator)
+            p_dev = ctypes.c_void_p()
+            try:
+                hr = self._com_call(p_enum, 4, get_def_proto, EFLOW_RENDER, int(role), ctypes.byref(p_dev))
+                if hr < 0 or not p_dev.value:
+                    return None
+                return self._read_device_id(ole32, p_dev)
+            finally:
+                self._com_release(p_dev)
+                self._com_release(p_enum)
+
+        return self._with_com(work)
+
+    def set_default_endpoint(self, device_id: str, roles: Tuple[int, ...]) -> None:
+        def work(ole32) -> None:
+            set_def_proto = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+                ctypes.c_int32, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32
+            )
+            slot = 13
+            try:
+                p_cfg = self._co_create(ole32, CLSID_CPolicyConfigClient, IID_IPolicyConfig)
+            except OSError:
+                p_cfg = self._co_create(ole32, CLSID_CPolicyConfigVistaClient, IID_IPolicyConfigVista)
+                slot = 12
+            try:
+                for role in roles:
+                    hr = self._com_call(p_cfg, slot, set_def_proto, device_id, int(role))
+                    if hr < 0:
+                        raise OSError(f"SetDefaultEndpoint(role={role}) failed with HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+            finally:
+                self._com_release(p_cfg)
+
+        self._with_com(work)
 
 
 class SP_DEVICE_INTERFACE_DATA(ctypes.Structure):
@@ -935,6 +1662,11 @@ class Win32HidDevice:
         self.input_len = input_len
         self.output_len = output_len
         self._closed = False
+        self._handles_closed = False
+        self._io_refs = 0
+        self._handle = None
+        self._read_ev = None
+        self._write_ev = None
         self._close_lock = threading.Lock()
         self._write_lock = threading.Lock()
 
@@ -960,61 +1692,106 @@ class Win32HidDevice:
             self.close()
             raise OSError(err, f"CreateEventW failed on {path}: error {err}")
 
+    def _acquire_io(self) -> Tuple[object, object, object]:
+        with self._close_lock:
+            if self._closed or not self._handle or self._handle == INVALID_HANDLE_VALUE:
+                raise OSError(f"Device closed: {self.key}")
+            self._io_refs += 1
+            return self._handle, self._read_ev, self._write_ev
+
+    def _pop_handles_if_ready_locked(self) -> Tuple[object, ...]:
+        if not (self._closed and self._io_refs == 0 and not self._handles_closed):
+            return ()
+        self._handles_closed = True
+        handles = tuple(
+            h
+            for h in (self._handle, self._read_ev, self._write_ev)
+            if h and h != INVALID_HANDLE_VALUE
+        )
+        self._handle = None
+        self._read_ev = None
+        self._write_ev = None
+        return handles
+
+    def _close_handles(self, handles: Tuple[object, ...]) -> None:
+        for h in handles:
+            if h and h != INVALID_HANDLE_VALUE:
+                self._apis.CloseHandle(h)
+
+    def _release_io(self) -> None:
+        with self._close_lock:
+            if self._io_refs > 0:
+                self._io_refs -= 1
+            handles = self._pop_handles_if_ready_locked()
+        self._close_handles(handles)
+
     def write_report(self, payload: bytes) -> None:
         frame = (b"\x00" + payload).ljust(self.output_len, b"\x00")[: self.output_len]
         tx_buf = ctypes.create_string_buffer(frame, len(frame))
         written = ctypes.c_uint32(0)
 
-        with self._write_lock:
-            if self._closed or not self._handle:
-                raise OSError(f"Device closed: {self.key}")
-            self._apis.ResetEvent(self._write_ev)
-            ov = Win32OVERLAPPED(hEvent=self._write_ev)
-            ok = self._apis.WriteFile(self._handle, tx_buf, len(frame), ctypes.byref(written), ctypes.byref(ov))
+        handle, _, write_ev = self._acquire_io()
+        try:
+            with self._write_lock:
+                if self._closed:
+                    raise OSError(f"Device closed: {self.key}")
+                self._apis.ResetEvent(write_ev)
+                ov = Win32OVERLAPPED(hEvent=write_ev)
+                ok = self._apis.WriteFile(handle, tx_buf, len(frame), ctypes.byref(written), ctypes.byref(ov))
+                if not ok:
+                    err = self._apis.get_last_error()
+                    if err != ERROR_IO_PENDING:
+                        raise OSError(err, f"WriteFile failed on {self.key}: error {err}")
+                    wres = self._apis.WaitForSingleObject(write_ev, 500)
+                    if wres == WAIT_OBJECT_0:
+                        if not self._apis.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(written), 0):
+                            err = self._apis.get_last_error()
+                            raise OSError(err, f"GetOverlappedResult(write) failed on {self.key}: error {err}")
+                    else:
+                        # CancelIoEx is async: wait for kernel IRP completion before releasing ov/tx_buf.
+                        self._apis.CancelIoEx(handle, ctypes.byref(ov))
+                        completed = bool(
+                            self._apis.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(written), 1)
+                        )
+                        if not (wres == WAIT_TIMEOUT and completed and written.value >= len(frame)):
+                            raise OSError(f"WriteFile wait failed on {self.key}: {wres}")
+        finally:
+            self._release_io()
+
+    def read_report(self, timeout_ms: int = 250) -> Optional[bytes]:
+        handle, read_ev, _ = self._acquire_io()
+        try:
+            rx_buf = ctypes.create_string_buffer(self.input_len)
+            bytes_read = ctypes.c_uint32(0)
+            self._apis.ResetEvent(read_ev)
+            ov = Win32OVERLAPPED(hEvent=read_ev)
+            ok = self._apis.ReadFile(handle, rx_buf, self.input_len, ctypes.byref(bytes_read), ctypes.byref(ov))
             if not ok:
                 err = self._apis.get_last_error()
                 if err != ERROR_IO_PENDING:
-                    raise OSError(err, f"WriteFile failed on {self.key}: error {err}")
-                wres = self._apis.WaitForSingleObject(self._write_ev, 500)
-                if wres != WAIT_OBJECT_0:
-                    self._apis.CancelIoEx(self._handle, ctypes.byref(ov))
-                    raise OSError(f"WriteFile wait failed on {self.key}: {wres}")
-                if not self._apis.GetOverlappedResult(self._handle, ctypes.byref(ov), ctypes.byref(written), 0):
-                    err = self._apis.get_last_error()
-                    raise OSError(err, f"GetOverlappedResult(write) failed on {self.key}: error {err}")
-
-    def read_report(self, timeout_ms: int = 250) -> Optional[bytes]:
-        if self._closed or not self._handle:
-            raise OSError(f"Device closed: {self.key}")
-        rx_buf = ctypes.create_string_buffer(self.input_len)
-        bytes_read = ctypes.c_uint32(0)
-        self._apis.ResetEvent(self._read_ev)
-        ov = Win32OVERLAPPED(hEvent=self._read_ev)
-        ok = self._apis.ReadFile(self._handle, rx_buf, self.input_len, ctypes.byref(bytes_read), ctypes.byref(ov))
-        if not ok:
-            err = self._apis.get_last_error()
-            if err != ERROR_IO_PENDING:
-                raise OSError(err, f"ReadFile failed on {self.key}: error {err}")
-            wres = self._apis.WaitForSingleObject(self._read_ev, max(0, int(timeout_ms)))
-            if wres == WAIT_OBJECT_0:
-                if not self._apis.GetOverlappedResult(self._handle, ctypes.byref(ov), ctypes.byref(bytes_read), 0):
-                    err = self._apis.get_last_error()
-                    raise OSError(err, f"GetOverlappedResult(read) failed on {self.key}: error {err}")
-            elif wres == WAIT_TIMEOUT:
-                self._apis.CancelIoEx(self._handle, ctypes.byref(ov))
-                bytes_read.value = 0
-                if not self._apis.GetOverlappedResult(self._handle, ctypes.byref(ov), ctypes.byref(bytes_read), 1):
+                    raise OSError(err, f"ReadFile failed on {self.key}: error {err}")
+                wres = self._apis.WaitForSingleObject(read_ev, max(0, int(timeout_ms)))
+                if wres == WAIT_OBJECT_0:
+                    if not self._apis.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(bytes_read), 0):
+                        err = self._apis.get_last_error()
+                        raise OSError(err, f"GetOverlappedResult(read) failed on {self.key}: error {err}")
+                elif wres == WAIT_TIMEOUT:
+                    self._apis.CancelIoEx(handle, ctypes.byref(ov))
+                    bytes_read.value = 0
+                    if not self._apis.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(bytes_read), 1):
+                        return None
+                    if bytes_read.value > 0:
+                        return bytes(rx_buf[: bytes_read.value])
                     return None
-                if bytes_read.value > 0:
-                    return bytes(rx_buf[: bytes_read.value])
-                return None
-            else:
-                self._apis.CancelIoEx(self._handle, ctypes.byref(ov))
-                self._apis.GetOverlappedResult(self._handle, ctypes.byref(ov), ctypes.byref(bytes_read), 1)
-                raise OSError(f"ReadFile wait failed on {self.key}: {wres}")
-        if bytes_read.value > 0:
-            return bytes(rx_buf[: bytes_read.value])
-        return None
+                else:
+                    self._apis.CancelIoEx(handle, ctypes.byref(ov))
+                    self._apis.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(bytes_read), 1)
+                    raise OSError(f"ReadFile wait failed on {self.key}: {wres}")
+            if bytes_read.value > 0:
+                return bytes(rx_buf[: bytes_read.value])
+            return None
+        finally:
+            self._release_io()
 
     def read_report_timeout(self, timeout_ms: int = 250) -> Optional[bytes]:
         return self.read_report(timeout_ms=timeout_ms)
@@ -1023,56 +1800,68 @@ class Win32HidDevice:
         rx_buf = ctypes.create_string_buffer(self.input_len)
         bytes_read = ctypes.c_uint32(0)
 
-        while not stop_ev.is_set() and not self._closed:
-            self._apis.ResetEvent(self._read_ev)
-            ov = Win32OVERLAPPED(hEvent=self._read_ev)
-            bytes_read.value = 0
-            ok = self._apis.ReadFile(self._handle, rx_buf, self.input_len, ctypes.byref(bytes_read), ctypes.byref(ov))
-            if not ok:
-                err = self._apis.get_last_error()
-                if err != ERROR_IO_PENDING:
-                    break
-                while True:
-                    wres = self._apis.WaitForSingleObject(self._read_ev, 250)
-                    if stop_ev.is_set() or self._closed:
-                        self._apis.CancelIoEx(self._handle, ctypes.byref(ov))
-                        self._apis.GetOverlappedResult(self._handle, ctypes.byref(ov), ctypes.byref(bytes_read), 1)
-                        return
-                    if wres == WAIT_OBJECT_0:
-                        if not self._apis.GetOverlappedResult(self._handle, ctypes.byref(ov), ctypes.byref(bytes_read), 0):
-                            return
+        try:
+            handle, read_ev, _ = self._acquire_io()
+        except OSError:
+            return
+
+        try:
+            while not stop_ev.is_set() and not self._closed:
+                self._apis.ResetEvent(read_ev)
+                ov = Win32OVERLAPPED(hEvent=read_ev)
+                bytes_read.value = 0
+                ok = self._apis.ReadFile(handle, rx_buf, self.input_len, ctypes.byref(bytes_read), ctypes.byref(ov))
+                if not ok:
+                    err = self._apis.get_last_error()
+                    if err != ERROR_IO_PENDING:
                         break
-                    if wres != WAIT_TIMEOUT:
+                    while True:
+                        wres = self._apis.WaitForSingleObject(read_ev, 250)
+                        if stop_ev.is_set() or self._closed:
+                            self._apis.CancelIoEx(handle, ctypes.byref(ov))
+                            self._apis.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(bytes_read), 1)
+                            return
+                        if wres == WAIT_OBJECT_0:
+                            if not self._apis.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(bytes_read), 0):
+                                return
+                            break
+                        if wres == WAIT_TIMEOUT:
+                            continue
+                        self._apis.CancelIoEx(handle, ctypes.byref(ov))
+                        self._apis.GetOverlappedResult(handle, ctypes.byref(ov), ctypes.byref(bytes_read), 1)
                         return
 
-            if bytes_read.value > 0:
-                on_packet(self.key, bytes(rx_buf[: bytes_read.value]))
+                if bytes_read.value > 0:
+                    on_packet(self.key, bytes(rx_buf[: bytes_read.value]))
+        finally:
+            self._release_io()
 
     def close(self) -> None:
+        handle = None
+        handles: Tuple[object, ...] = ()
         with self._close_lock:
             if self._closed:
                 return
             self._closed = True
-            handle = self._handle
-            read_ev = getattr(self, "_read_ev", None)
-            write_ev = getattr(self, "_write_ev", None)
-            self._handle = None
-            self._read_ev = None
-            self._write_ev = None
-            if handle and handle != INVALID_HANDLE_VALUE:
-                try:
-                    self._apis.CancelIoEx(handle, None)
-                finally:
-                    self._apis.CloseHandle(handle)
-            if read_ev:
-                self._apis.CloseHandle(read_ev)
-            if write_ev:
-                self._apis.CloseHandle(write_ev)
+            if self._handle and self._handle != INVALID_HANDLE_VALUE:
+                handle = self._handle
+                self._io_refs += 1
+            else:
+                handles = self._pop_handles_if_ready_locked()
+        if handle is not None:
+            try:
+                self._apis.CancelIoEx(handle, None)
+            finally:
+                self._release_io()
+        else:
+            self._close_handles(handles)
 
 
 def run_win32_hid(coord: BridgeCoordinator) -> None:
     apis = _load_win32_apis()
     threads: Dict[str, Tuple[threading.Event, Win32HidDevice]] = {}
+    fail_counts: Dict[str, int] = {}
+    retry_after: Dict[str, float] = {}
 
     def reader_worker(key: str, stop_ev: threading.Event, dev: Win32HidDevice) -> None:
         try:
@@ -1086,23 +1875,34 @@ def run_win32_hid(coord: BridgeCoordinator) -> None:
         now = time.monotonic()
         if len(threads) < 2 or (now - last_scan >= RESCAN_INTERVAL_S):
             last_scan = now
-            for path, in_len, out_len in discover_win32_hid_devices(apis):
-                if path not in threads:
-                    try:
-                        dev = Win32HidDevice(apis, path, in_len, out_len)
-                        stop_ev = threading.Event()
-                        threads[path] = (stop_ev, dev)
-                        coord.register_device(path, dev)
-                        t = threading.Thread(
-                            target=reader_worker,
-                            args=(path, stop_ev, dev),
-                            name=f"sofle-win32-{len(threads)}",
-                            daemon=True,
-                        )
-                        t.start()
-                    except OSError as exc:
-                        threads.pop(path, None)
-                        coord._log(f"Cannot open {path}: {exc}")
+            discovered = discover_win32_hid_devices(apis)
+            _prune_probe_backoff(fail_counts, retry_after, {path for path, _, _ in discovered})
+            for path, in_len, out_len in discovered:
+                if path in threads or now < retry_after.get(path, 0.0):
+                    continue
+                try:
+                    dev = Win32HidDevice(apis, path, in_len, out_len)
+                except OSError as exc:
+                    _record_probe_failure(fail_counts, retry_after, path, now)
+                    coord._log(f"Cannot open {path}: {exc}")
+                    continue
+
+                stop_ev = threading.Event()
+                threads[path] = (stop_ev, dev)
+                if not coord.register_device(path, dev):
+                    threads.pop(path, None)
+                    dev.close()
+                    _record_probe_failure(fail_counts, retry_after, path, now)
+                    continue
+
+                _clear_probe_backoff(fail_counts, retry_after, path)
+                t = threading.Thread(
+                    target=reader_worker,
+                    args=(path, stop_ev, dev),
+                    name=f"sofle-win32-{len(threads)}",
+                    daemon=True,
+                )
+                t.start()
 
         coord.tick_pings(now)
         time.sleep(0.1)
@@ -1179,6 +1979,8 @@ def discover_hidapi_paths(hid_mod) -> List[Tuple[str, object]]:
 def run_hidapi(coord: BridgeCoordinator) -> None:
     hid_mod = _import_hid_module()
     threads: Dict[str, Tuple[threading.Event, HidapiDeviceWrapper]] = {}
+    fail_counts: Dict[str, int] = {}
+    retry_after: Dict[str, float] = {}
 
     def reader_loop(key: str, stop_ev: threading.Event, dev: HidapiDeviceWrapper) -> None:
         try:
@@ -1198,23 +2000,34 @@ def run_hidapi(coord: BridgeCoordinator) -> None:
         now = time.monotonic()
         if len(threads) < 2 or (now - last_scan >= RESCAN_INTERVAL_S):
             last_scan = now
-            for key, raw_path in discover_hidapi_paths(hid_mod):
-                if key not in threads:
-                    try:
-                        dev = HidapiDeviceWrapper(hid_mod, raw_path)
-                        stop_ev = threading.Event()
-                        threads[key] = (stop_ev, dev)
-                        coord.register_device(key, dev)
-                        t = threading.Thread(
-                            target=reader_loop,
-                            args=(key, stop_ev, dev),
-                            name=f"sofle-read-{len(threads)}",
-                            daemon=True,
-                        )
-                        t.start()
-                    except OSError as exc:
-                        threads.pop(key, None)
-                        coord._log(f"Cannot open {key}: {exc}")
+            discovered = discover_hidapi_paths(hid_mod)
+            _prune_probe_backoff(fail_counts, retry_after, {key for key, _ in discovered})
+            for key, raw_path in discovered:
+                if key in threads or now < retry_after.get(key, 0.0):
+                    continue
+                try:
+                    dev = HidapiDeviceWrapper(hid_mod, raw_path)
+                except OSError as exc:
+                    _record_probe_failure(fail_counts, retry_after, key, now)
+                    coord._log(f"Cannot open {key}: {exc}")
+                    continue
+
+                stop_ev = threading.Event()
+                threads[key] = (stop_ev, dev)
+                if not coord.register_device(key, dev):
+                    threads.pop(key, None)
+                    dev.close()
+                    _record_probe_failure(fail_counts, retry_after, key, now)
+                    continue
+
+                _clear_probe_backoff(fail_counts, retry_after, key)
+                t = threading.Thread(
+                    target=reader_loop,
+                    args=(key, stop_ev, dev),
+                    name=f"sofle-read-{len(threads)}",
+                    daemon=True,
+                )
+                t.start()
 
         coord.tick_pings(now)
         time.sleep(0.1)
@@ -1248,9 +2061,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Send a one-shot Home Assistant hex lights toggle request and exit",
     )
+    parser.add_argument("--audio-config", default=None, help="Path to audio_config.json override")
+    parser.add_argument(
+        "--audio-devices",
+        default=None,
+        help="Comma-separated Windows playback device names to swap (e.g. 'Wireless Headset,Speakers')",
+    )
+    parser.add_argument(
+        "--audio-include-comms",
+        action="store_true",
+        help="Also switch the Windows Default Communications audio device when swapping",
+    )
+    parser.add_argument(
+        "--list-audio-devices",
+        action="store_true",
+        help="List active Windows playback endpoints and exit",
+    )
+    parser.add_argument(
+        "--test-audio-swap",
+        action="store_true",
+        help="Swap between the configured Windows audio output devices once and exit",
+    )
     args = parser.parse_args(argv)
 
-    dispatcher = HomeAssistantActionDispatcher(
+    ha_dispatcher = HomeAssistantActionDispatcher(
         config_path=args.ha_config,
         cli_url=args.ha_url,
         cli_webhook_id=args.ha_webhook_id,
@@ -1258,12 +2092,47 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     if args.test_hex_toggle:
-        ok = dispatcher.trigger_hex_toggle(side="cli")
+        ok = ha_dispatcher.trigger_hex_toggle(side="cli")
         return 0 if ok else 1
+
+    audio_dispatcher = AudioSwapDispatcher(
+        config_path=args.audio_config,
+        cli_devices=args.audio_devices,
+        include_comms=args.audio_include_comms,
+        verbose=args.verbose,
+    )
+
+    if args.list_audio_devices:
+        try:
+            endpoints, def_console, def_comms = audio_dispatcher.list_devices()
+        except OSError as exc:
+            print(f"[sofle-sync] {exc}", file=sys.stderr, flush=True)
+            return 1
+        for ep in endpoints:
+            tags: List[str] = []
+            if ep.device_id == def_console:
+                tags.append("DEFAULT")
+            if ep.device_id == def_comms:
+                tags.append("COMMS")
+            tag_str = f" [{', '.join(tags)}]" if tags else ""
+            print(f"{ep.friendly_name}{tag_str}", flush=True)
+        return 0
+
+    if args.test_audio_swap:
+        ok = audio_dispatcher.swap_audio_output(side="cli")
+        return 0 if ok else 1
+
+    router = HostActionRouter(
+        ha_dispatcher=ha_dispatcher,
+        audio_dispatcher=audio_dispatcher,
+        verbose=args.verbose,
+    )
 
     backend = resolve_backend(args.backend)
 
-    coord = BridgeCoordinator(verbose=args.verbose, action_handler=dispatcher.dispatch_async)
+    coord = BridgeCoordinator(verbose=args.verbose, action_handler=router.dispatch_async)
+    audio_dispatcher.set_state_callback(coord.set_host_audio_state)
+    audio_dispatcher.start_state_monitor()
     if args.verbose:
         print(f"[sofle-sync] Starting on {sys.platform} using '{backend}' backend", flush=True)
 

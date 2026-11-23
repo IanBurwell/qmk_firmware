@@ -1,0 +1,10 @@
+{
+  "devices": [
+    "Wireless Headset",
+    "Speakers"
+  ],
+  "roles": [
+    "console",
+    "multimedia"
+  ]
+}

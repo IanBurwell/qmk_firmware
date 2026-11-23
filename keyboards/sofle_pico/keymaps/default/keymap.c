@@ -36,6 +36,32 @@ extern usb_endpoint_out_t usb_endpoints_out[USB_ENDPOINT_OUT_COUNT];
 #    define USB_STATE_IS_ACTIVE() (USB_DRIVER.state == USB_ACTIVE)
 #    define USB_REMOTE_WAKEUP_ENABLED() ((USB_DRIVER.status & 2U) != 0U)
 
+extern void watchdog_enable(uint32_t delay_ms, bool pause_on_debug);
+extern void watchdog_update(void);
+
+#    define SOFLE_WDT_TIMEOUT_MS 4000U
+static bool sofle_wdt_enabled = false;
+
+static void sofle_wdt_enable(void) {
+    watchdog_enable(SOFLE_WDT_TIMEOUT_MS, true);
+    sofle_wdt_enabled = true;
+}
+
+static void sofle_wdt_feed(void) {
+    if (sofle_wdt_enabled) {
+        watchdog_update();
+    }
+}
+
+static void sofle_wdt_disable(void) {
+    if (sofle_wdt_enabled) {
+        osalSysLock();
+        WATCHDOG->CTRL &= ~WATCHDOG_CTRL_ENABLE;
+        osalSysUnlock();
+        sofle_wdt_enabled = false;
+    }
+}
+
 static void sofle_usb_arm_sof_wakeup(void) {
     osalSysLock();
     if (USB_DRIVER.state == USB_SUSPENDED && (USB->INTE & USB_INTE_DEV_SOF) == 0U) {
@@ -55,20 +81,33 @@ static void sofle_usb_rearm_raw_out(void) {
     osalSysLock();
     if (usbGetDriverStateI(&USB_DRIVER) == USB_ACTIVE) {
         usb_endpoint_out_t *ep = &usb_endpoints_out[USB_ENDPOINT_OUT_RAW];
-        if (ep->config.usbp == &USB_DRIVER && USB_DRIVER.epc[ep->config.ep] != NULL && USB_DRIVER.epc[ep->config.ep]->out_state != NULL && !usbGetReceiveStatusI(ep->config.usbp, ep->config.ep)) {
-            uint8_t *buffer = ibqGetEmptyBufferI(&ep->ibqueue);
-            if (buffer != NULL) {
-                USBOutEndpointState *oesp = USB_DRIVER.epc[ep->config.ep]->out_state;
-                size_t               len  = ep->ibqueue.bsize - sizeof(size_t);
-                if ((USB_DPSRAM->BUFCTRL[ep->config.ep].OUT & USB_BUFFER_BUFFER0_AVAILABLE) != 0U) {
-                    // Hardware buffer is still armed from pre-suspend; preserve DATA0/DATA1 PID
-                    oesp->rxbuf  = buffer;
-                    oesp->rxcnt  = 0;
-                    oesp->rxsize = len;
-                    oesp->rxpkts = 1;
-                    USB_DRIVER.receiving |= (uint16_t)(1U << ep->config.ep);
-                } else {
-                    usbStartReceiveI(ep->config.usbp, ep->config.ep, buffer, len);
+        if (ep->config.usbp == &USB_DRIVER && USB_DRIVER.epc[ep->config.ep] != NULL && USB_DRIVER.epc[ep->config.ep]->out_state != NULL) {
+            if (!usbGetReceiveStatusI(ep->config.usbp, ep->config.ep)) {
+                uint8_t *buffer = ibqGetEmptyBufferI(&ep->ibqueue);
+                if (buffer != NULL) {
+                    USBOutEndpointState *oesp = USB_DRIVER.epc[ep->config.ep]->out_state;
+                    size_t               len  = ep->ibqueue.bsize - sizeof(size_t);
+                    if ((USB_DPSRAM->BUFCTRL[ep->config.ep].OUT & USB_BUFFER_BUFFER0_AVAILABLE) != 0U) {
+                        // Hardware buffer is still armed from pre-suspend; preserve DATA0/DATA1 PID
+                        oesp->rxbuf  = buffer;
+                        oesp->rxcnt  = 0;
+                        oesp->rxsize = len;
+                        oesp->rxpkts = 1;
+                        USB_DRIVER.receiving |= (uint16_t)(1U << ep->config.ep);
+                    } else {
+                        usbStartReceiveI(ep->config.usbp, ep->config.ep, buffer, len);
+                    }
+                }
+            } else {
+                // Recover if receiving flag is set while hardware OUT buffer is neither armed nor pending ISR
+                uint32_t out_ctrl = USB_DPSRAM->BUFCTRL[ep->config.ep].OUT;
+                uint32_t out_bit  = 1U << (ep->config.ep * 2U + 1U);
+                if ((out_ctrl & (USB_BUFFER_BUFFER0_AVAILABLE | USB_BUFFER_BUFFER0_FULL)) == 0U && (USB->BUFSTATUS & out_bit) == 0U) {
+                    uint8_t *buffer = ibqGetEmptyBufferI(&ep->ibqueue);
+                    if (buffer != NULL) {
+                        USB_DRIVER.receiving &= (uint16_t)~(1U << ep->config.ep);
+                        usbStartReceiveI(ep->config.usbp, ep->config.ep, buffer, ep->ibqueue.bsize - sizeof(size_t));
+                    }
                 }
             }
         }
@@ -78,6 +117,10 @@ static void sofle_usb_rearm_raw_out(void) {
 }
 #elif defined(SOFLE_USB_RECOVERY_TEST)
 #    define SOFLE_USB_RECOVERY_ENABLED 1
+#else
+static inline void sofle_wdt_enable(void) {}
+static inline void sofle_wdt_feed(void) {}
+static inline void sofle_wdt_disable(void) {}
 #endif
 
 #define USR_BTN_PIN GP24
@@ -92,6 +135,7 @@ enum sofle_layers {
 
 enum sofle_keycodes {
     HA_HEX_TOGG = SAFE_RANGE,
+    WIN_AUD_SWP,
 };
 
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
@@ -120,7 +164,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     [_ADJUST] = LAYOUT(
         QK_BOOT,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,                            RM_HUED,  RM_HUEU,  RM_SATD,  RM_SATU,  XXXXXXX,  XXXXXXX,
         XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,                            RM_NEXT,  RM_VALD,  RM_VALU,  RM_TOGG,  RM_SPDU,  XXXXXXX,
-        XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  HA_HEX_TOGG, XXXXXXX,                         RM_PREV,  KC_VOLD,  KC_MUTE,  KC_VOLU,  RM_SPDD,  XXXXXXX,
+        XXXXXXX,  XXXXXXX,  XXXXXXX,  WIN_AUD_SWP, HA_HEX_TOGG, XXXXXXX,                      RM_PREV,  KC_VOLD,  KC_MUTE,  KC_VOLU,  RM_SPDD,  XXXXXXX,
         XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,        XXXXXXX,  RM_TOGG,  _______,  _______,  _______,  XXXXXXX,  XXXXXXX,
                             _______,  _______,  _______,  _______,  _______,        _______,  _______,  _______,  _______,  _______
     )
@@ -137,6 +181,8 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][NUM_DIRECTIONS] = {
 #define SLAVE_HDR_LIGHTS_OFF  0x01
 #define SLAVE_HDR_CAPS_LOCK   0x02
 #define SLAVE_HDR_WAKE_ACTIVE 0x04
+#define SLAVE_HDR_AUDIO_SHIFT 3
+#define SLAVE_HDR_AUDIO_MASK  0x18 // 2-bit host_audio_output_t (0=unknown, 1=headset, 2=speaker)
 
 typedef enum {
     OLED_APP_KEYMAP = 0, // Default: dynamic keymap & encoder layout
@@ -361,11 +407,13 @@ typedef struct {
 
 _Static_assert(sizeof(rgb_mode_presets_store_t) == EECONFIG_USER_DATA_SIZE, "rgb_mode_presets_store_t must match EECONFIG_USER_DATA_SIZE");
 
-static rgb_mode_presets_store_t rgb_presets             = {0};
-static bool                     rgb_presets_loaded      = false;
-static bool                     rgb_presets_dirty       = false;
-static uint32_t                 rgb_presets_dirty_since = 0;
-static uint8_t                  tracked_rgb_mode        = 0;
+static rgb_mode_presets_store_t rgb_presets                  = {0};
+static bool                     rgb_presets_loaded           = false;
+static bool                     rgb_presets_dirty            = false;
+static uint32_t                 rgb_presets_dirty_since      = 0;
+static bool                     synced_rgb_eeprom_dirty      = false;
+static uint32_t                 synced_rgb_eeprom_dirty_since = 0;
+static uint8_t                  tracked_rgb_mode             = 0;
 static uint8_t                  tracked_rgb_h           = 0;
 static uint8_t                  tracked_rgb_s           = 0;
 static uint8_t                  tracked_rgb_v           = 0;
@@ -435,13 +483,22 @@ static void rgb_presets_store_slot(uint8_t mode, uint8_t h, uint8_t s, uint8_t v
     }
 }
 
+static void rgb_synced_eeprom_mark_dirty(void) {
+    synced_rgb_eeprom_dirty       = true;
+    synced_rgb_eeprom_dirty_since = timer_read32();
+}
+
 static void rgb_presets_flush_if_dirty(bool force) {
-    if (!rgb_presets_dirty || !is_keyboard_master()) {
+    if (!is_keyboard_master()) {
         return;
     }
-    if (force || timer_elapsed32(rgb_presets_dirty_since) >= RGB_PRESET_SAVE_DELAY_MS) {
+    if (rgb_presets_dirty && (force || timer_elapsed32(rgb_presets_dirty_since) >= RGB_PRESET_SAVE_DELAY_MS)) {
         eeconfig_update_user_datablock(&rgb_presets, 0, sizeof(rgb_presets));
         rgb_presets_dirty = false;
+    }
+    if (synced_rgb_eeprom_dirty && (force || timer_elapsed32(synced_rgb_eeprom_dirty_since) >= RGB_PRESET_SAVE_DELAY_MS)) {
+        eeconfig_force_flush_rgb_matrix();
+        synced_rgb_eeprom_dirty = false;
     }
 }
 
@@ -550,9 +607,17 @@ static inline void rgb_presets_track_and_apply_local(void) {}
 #define RAW_MSG_BOOTLOADER        0x04
 #define RAW_MSG_HOST_ACTION       0x05
 #define HOST_ACTION_HA_HEX_TOGGLE 0x01
+#define HOST_ACTION_AUDIO_SWAP    0x02
+#define RAW_MSG_HOST_STATUS       0x06
 #define RAW_BOOTLOADER_DELAY_MS   60
 #define HOST_SYNC_TIMEOUT_MS      2500
 #define ACTIVITY_WAKE_THROTTLE_MS 1000
+
+typedef enum {
+    HOST_AUDIO_UNKNOWN = 0, // Unknown/disconnected -> show Speaker icon
+    HOST_AUDIO_HEADSET = 1, // Currently on Headset -> pressing switches to Speakers -> show Speaker icon
+    HOST_AUDIO_SPEAKER = 2, // Currently on Speakers -> pressing switches to Headset -> show Headphones icon
+} host_audio_output_t;
 
 #define HALF_FLAG_LOWER_HELD    0x01
 #define HALF_FLAG_UPPER_HELD    0x02
@@ -566,6 +631,9 @@ static inline void rgb_presets_track_and_apply_local(void) {}
 static bool                host_service_connected   = false;
 static bool                host_peer_connected      = false;
 static uint32_t            host_service_last_rx     = 0;
+static uint8_t             host_audio_output        = HOST_AUDIO_UNKNOWN;
+static bool                host_status_active       = false;
+static uint32_t            host_status_last_rx      = 0;
 static bool                bootloader_pending       = false;
 static uint32_t            bootloader_req_time      = 0;
 static uint32_t            last_activity_sync_tx    = 0;
@@ -754,7 +822,7 @@ static void host_sync_send_action(uint8_t action_id) {
 #endif
 }
 
-static void clear_host_sync_state(void) {
+static void clear_dual_usb_peer_state(void) {
     bool was_host_paired  = host_peer_connected;
     bool had_app_override = !is_transport_connected() && was_host_paired && is_keyboard_left() && (current_oled_app != OLED_APP_KEYMAP);
     bool had_remote       = host_service_connected || host_peer_connected || remote_lower_held || remote_upper_held || (remote_mods != 0) || had_app_override;
@@ -770,6 +838,12 @@ static void clear_host_sync_state(void) {
     if (had_remote) {
         apply_combined_tri_layers();
     }
+}
+
+static void clear_host_sync_state(void) {
+    host_audio_output  = HOST_AUDIO_UNKNOWN;
+    host_status_active = false;
+    clear_dual_usb_peer_state();
 }
 
 #if defined(VIA_ENABLE) && defined(RAW_ENABLE)
@@ -828,12 +902,24 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
         return true;
     }
 
+    if (msg_type == RAW_MSG_HOST_STATUS) {
+        uint8_t audio_state = data[4];
+        host_audio_output   = (audio_state <= HOST_AUDIO_SPEAKER) ? audio_state : HOST_AUDIO_UNKNOWN;
+        host_status_active  = (host_audio_output != HOST_AUDIO_UNKNOWN);
+        host_status_last_rx = timer_read32();
+        return true;
+    }
+
     if (is_transport_connected()) {
+        if (msg_type == RAW_MSG_HOST_PING) {
+            host_status_last_rx = timer_read32();
+        }
         return true;
     }
 
     if (msg_type == RAW_MSG_HOST_PING) {
         host_service_last_rx   = timer_read32();
+        host_status_last_rx    = host_service_last_rx;
         host_service_connected = true;
         bool new_peer          = (data[4] != 0);
         if (host_peer_connected && !new_peer) {
@@ -897,26 +983,29 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
                     wake_local_displays_and_rgb();
                 }
 #    ifdef RGB_MATRIX_ENABLE
+                bool rgb_ee_changed = false;
                 if (new_enable) {
                     if (!rgb_matrix_is_enabled()) {
-                        if (prev_lights_disabled) {
-                            rgb_matrix_enable_noeeprom();
-                        } else {
-                            rgb_matrix_enable();
+                        rgb_matrix_enable_noeeprom();
+                        if (!prev_lights_disabled) {
+                            rgb_ee_changed = true;
                         }
                     }
                     if (new_mode < 1 || new_mode >= RGB_MATRIX_EFFECT_MAX) {
                         new_mode = RGB_MATRIX_SOLID_COLOR;
                     }
                     if (rgb_matrix_get_mode() != new_mode) {
-                        rgb_matrix_mode(new_mode);
+                        rgb_matrix_mode_noeeprom(new_mode);
+                        rgb_ee_changed = true;
                     }
                     hsv_t cur_hsv = rgb_matrix_get_hsv();
                     if (cur_hsv.h != new_hue || cur_hsv.s != new_sat || cur_hsv.v != new_val) {
-                        rgb_matrix_sethsv(new_hue, new_sat, new_val);
+                        rgb_matrix_sethsv_noeeprom(new_hue, new_sat, new_val);
+                        rgb_ee_changed = true;
                     }
                     if (rgb_matrix_get_speed() != new_speed) {
-                        rgb_matrix_set_speed(new_speed);
+                        rgb_matrix_set_speed_noeeprom(new_speed);
+                        rgb_ee_changed = true;
                     }
                     if ((flags & HALF_FLAG_SYNC_TIMER) != 0) {
                         g_rgb_timer = 0;
@@ -924,7 +1013,11 @@ bool via_command_kb(uint8_t *data, uint8_t length) {
                     hsv_t synced_hsv = rgb_matrix_get_hsv();
                     rgb_presets_record_synced_state(rgb_matrix_get_mode(), synced_hsv.h, synced_hsv.s, synced_hsv.v, rgb_matrix_get_speed());
                 } else if (rgb_matrix_is_enabled()) {
-                    rgb_matrix_disable();
+                    rgb_matrix_disable_noeeprom();
+                    rgb_ee_changed = true;
+                }
+                if (rgb_ee_changed) {
+                    rgb_synced_eeprom_mark_dirty();
                 }
 #    endif
             }
@@ -989,6 +1082,12 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         }
         return false;
     }
+    if (keycode == WIN_AUD_SWP) {
+        if (record->event.pressed) {
+            host_sync_send_action(HOST_ACTION_AUDIO_SWAP);
+        }
+        return false;
+    }
     return true;
 }
 
@@ -1027,6 +1126,10 @@ void keyboard_post_init_user(void) {
 
     snapshot_current_rgb(&last_rgb_snapshot);
     last_sent_mods = get_local_mods();
+
+    if (is_keyboard_master()) {
+        sofle_wdt_enable();
+    }
 }
 
 void eeconfig_init_user(void) {
@@ -1043,6 +1146,7 @@ void eeconfig_init_user(void) {
 
 bool shutdown_user(bool jump_to_bootloader) {
     (void)jump_to_bootloader;
+    sofle_wdt_disable();
     rgb_presets_flush_if_dirty(true);
     return true;
 }
@@ -1088,6 +1192,7 @@ static void sofle_usb_trigger_restart(void) {
 #endif
 
 void suspend_power_down_user(void) {
+    sofle_wdt_feed();
     if (!is_keyboard_master() || bootloader_pending) {
         return;
     }
@@ -1135,9 +1240,11 @@ void notify_usb_device_state_change_user(struct usb_device_state state) {
 }
 
 void housekeeping_task_user(void) {
+    sofle_wdt_feed();
     if (is_keyboard_master()) {
         if (bootloader_pending && timer_elapsed32(bootloader_req_time) >= RAW_BOOTLOADER_DELAY_MS) {
             bootloader_pending = false;
+            sofle_wdt_disable();
             rgb_presets_flush_if_dirty(true);
             oled_off();
             reset_keyboard();
@@ -1165,7 +1272,7 @@ void housekeeping_task_user(void) {
 #endif
         bool trrs_connected = is_transport_connected();
         if (trrs_connected) {
-            clear_host_sync_state();
+            clear_dual_usb_peer_state();
             // Solid LED on TRRS master half
             gpio_write_pin_high(USR_LED_PIN);
         } else {
@@ -1178,6 +1285,10 @@ void housekeeping_task_user(void) {
             } else {
                 gpio_write_pin(USR_LED_PIN, host_keyboard_led_state().caps_lock);
             }
+        }
+        if (host_status_active && timer_elapsed32(host_status_last_rx) > HOST_SYNC_TIMEOUT_MS) {
+            host_audio_output  = HOST_AUDIO_UNKNOWN;
+            host_status_active = false;
         }
 
         static uint16_t poll_timer               = 0;
@@ -1192,6 +1303,11 @@ void housekeeping_task_user(void) {
 
         if (timer_elapsed(poll_timer) >= 20) {
             poll_timer = timer_read();
+#ifdef SOFLE_USB_RECOVERY_ENABLED
+            if (USB_STATE_IS_ACTIVE()) {
+                sofle_usb_rearm_raw_out();
+            }
+#endif
 
             bool master_btn = !gpio_read_pin(USR_BTN_PIN);
             bool slave_btn  = false;
@@ -1224,6 +1340,7 @@ void housekeeping_task_user(void) {
                 if (lights_disabled) hdr_flags |= SLAVE_HDR_LIGHTS_OFF;
                 if (caps) hdr_flags |= SLAVE_HDR_CAPS_LOCK;
                 if (!lights_disabled && last_input_activity_elapsed() < 2000) hdr_flags |= SLAVE_HDR_WAKE_ACTIVE;
+                hdr_flags |= (uint8_t)((host_audio_output & 0x03) << SLAVE_HDR_AUDIO_SHIFT);
 
                 slave_sync_packet_t pkt;
                 pkt.hdr.flags     = hdr_flags;
@@ -1294,6 +1411,9 @@ void housekeeping_task_user(void) {
 #    define CHAR_ARROW_DOWN '\x02'
 #    define CHAR_ARROW_LEFT '\x03'
 #    define CHAR_ARROW_RGHT '\x04'
+#    define CHAR_ICON_BULB       '\x05'
+#    define CHAR_ICON_SPEAKER    '\x06'
+#    define CHAR_ICON_HEADPHONES '\x07'
 
 // 5x7 font for single-character labels (ASCII 0x20..0x7E, 5 bytes per character)
 static const uint8_t PROGMEM oled_font5x7[][5] = {
@@ -1399,6 +1519,12 @@ static const uint8_t PROGMEM oled_arrows5x7[4][5] = {
     {0x10, 0x20, 0x7F, 0x20, 0x10}, // CHAR_ARROW_DOWN
     {0x08, 0x1C, 0x2A, 0x08, 0x08}, // CHAR_ARROW_LEFT
     {0x08, 0x08, 0x2A, 0x1C, 0x08}, // CHAR_ARROW_RGHT
+};
+
+static const uint16_t PROGMEM oled_icons7x9[3][7] = {
+    {0x00C, 0x012, 0x0E1, 0x1A1, 0x0E1, 0x012, 0x00C}, // CHAR_ICON_BULB (7x9)
+    {0x038, 0x038, 0x07C, 0x0FE, 0x000, 0x082, 0x07C}, // CHAR_ICON_SPEAKER (7x7 centered in 7x9)
+    {0x078, 0x0F4, 0x002, 0x002, 0x002, 0x0F4, 0x078}, // CHAR_ICON_HEADPHONES (7x7 centered in 7x9)
 };
 
 static void get_glyph3x7(char c, uint8_t out[3]) {
@@ -1521,7 +1647,8 @@ static char basic_to_short_char(uint8_t kc) {
     }
 }
 
-static void format_keycode_label(uint16_t kc, bool shift, bool caps, char out[4]) {
+static void format_keycode_label_ex(uint16_t kc, bool shift, bool caps, uint8_t audio_output, char out[4]) {
+    (void)audio_output;
     out[0] = '\0';
     out[1] = '\0';
     out[2] = '\0';
@@ -1778,7 +1905,10 @@ static void format_keycode_label(uint16_t kc, bool shift, bool caps, char out[4]
         case RM_VALD: out[0] = 'B'; out[1] = '-'; return;
         case RM_SPDU: out[0] = 'P'; out[1] = '+'; return;
         case RM_SPDD: out[0] = 'P'; out[1] = '-'; return;
-        case HA_HEX_TOGG: out[0] = 'H'; out[1] = 'X'; return;
+        case HA_HEX_TOGG: out[0] = CHAR_ICON_BULB; return;
+        case WIN_AUD_SWP:
+            out[0] = (audio_output == HOST_AUDIO_SPEAKER) ? CHAR_ICON_HEADPHONES : CHAR_ICON_SPEAKER;
+            return;
         case QK_BOOT: out[0] = 'B'; out[1] = 'T'; return;
         case QK_RBT:  out[0] = 'R'; out[1] = 'B'; return;
         case EE_CLR:  out[0] = 'E'; out[1] = 'E'; return;
@@ -1810,6 +1940,10 @@ static void format_keycode_label(uint16_t kc, bool shift, bool caps, char out[4]
     }
 }
 
+static void format_keycode_label(uint16_t kc, bool shift, bool caps, char out[4]) {
+    format_keycode_label_ex(kc, shift, caps, HOST_AUDIO_UNKNOWN, out);
+}
+
 static bool is_kc_active_pill(uint16_t kc, uint8_t top_layer, uint8_t mods, bool caps) {
     if ((kc == KC_LSFT || kc == KC_RSFT) && (mods & MOD_MASK_SHIFT)) return true;
     if ((kc == KC_LCTL || kc == KC_RCTL) && (mods & MOD_MASK_CTRL))  return true;
@@ -1837,6 +1971,16 @@ static void fb_draw_cols7(uint8_t *fb, uint8_t x, uint8_t y, const uint8_t *cols
     for (uint8_t dx = 0; dx < width; dx++) {
         uint8_t col_bits = cols[dx];
         for (uint8_t dy = 0; dy < 7; dy++) {
+            bool bit = (col_bits & (1U << dy)) != 0;
+            fb_set_pixel(fb, (uint8_t)(x + dx), (uint8_t)(y + dy), invert ? !bit : bit);
+        }
+    }
+}
+
+static void fb_draw_cols9(uint8_t *fb, uint8_t x, uint8_t y, const uint16_t *cols, uint8_t width, bool invert) {
+    for (uint8_t dx = 0; dx < width; dx++) {
+        uint16_t col_bits = cols[dx];
+        for (uint8_t dy = 0; dy < 9; dy++) {
             bool bit = (col_bits & (1U << dy)) != 0;
             fb_set_pixel(fb, (uint8_t)(x + dx), (uint8_t)(y + dy), invert ? !bit : bit);
         }
@@ -1998,6 +2142,15 @@ static void fb_draw_cell(uint8_t *fb, uint8_t cx, uint8_t cy, const char label[4
     uint8_t ty = (uint8_t)(cy + 3);
     if (label[1] == '\0') {
         uint8_t c = (uint8_t)label[0];
+        if (c >= (uint8_t)CHAR_ICON_BULB && c <= (uint8_t)CHAR_ICON_HEADPHONES) {
+            uint16_t icon[7];
+            uint8_t  idx = (uint8_t)(c - (uint8_t)CHAR_ICON_BULB);
+            for (uint8_t i = 0; i < 7; i++) {
+                icon[i] = pgm_read_word(&oled_icons7x9[idx][i]);
+            }
+            fb_draw_cols9(fb, (uint8_t)(cx + 1), (uint8_t)(cy + 2), icon, 7, active);
+            return;
+        }
         uint8_t glyph[5];
         if (c >= 1 && c <= 4) {
             for (uint8_t i = 0; i < 5; i++) {
@@ -2100,7 +2253,7 @@ static void format_layer_conn_header(uint8_t top_layer, oled_conn_mode_t conn_mo
     hdr[hlen] = '\0';
 }
 
-static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, oled_conn_mode_t conn_mode, uint8_t mods, bool caps, const uint8_t pressed_rows[5], const uint16_t keys[5][6], uint16_t enc_ccw, uint16_t enc_cw) {
+static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, oled_conn_mode_t conn_mode, uint8_t mods, bool caps, uint8_t audio_output, const uint8_t pressed_rows[5], const uint16_t keys[5][6], uint16_t enc_ccw, uint16_t enc_cw) {
     memset(fb, 0, OLED_MATRIX_SIZE);
 
     bool shift = (mods & MOD_MASK_SHIFT) != 0;
@@ -2136,7 +2289,7 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, ole
             uint8_t  mat_c   = is_left ? disp_c : (uint8_t)(5 - disp_c);
             uint16_t kc      = keys[r][mat_c];
             char     lbl[4];
-            format_keycode_label(kc, shift, caps, lbl);
+            format_keycode_label_ex(kc, shift, caps, audio_output, lbl);
             bool    pressed = (pressed_rows[r] & (1U << mat_c)) != 0;
             bool    act     = pressed || is_kc_active_pill(kc, top_layer, mods, caps);
             uint8_t cx      = oled_col_x[disp_c];
@@ -2156,8 +2309,8 @@ static void render_oled_layout(uint8_t *fb, bool is_left, uint8_t top_layer, ole
     fb_draw_hline(fb, 0, 109, OLED_PORTRAIT_W, true);
 
     char lbl_ccw[4], lbl_cw[4];
-    format_keycode_label(enc_ccw, shift, caps, lbl_ccw);
-    format_keycode_label(enc_cw, shift, caps, lbl_cw);
+    format_keycode_label_ex(enc_ccw, shift, caps, audio_output, lbl_ccw);
+    format_keycode_label_ex(enc_cw, shift, caps, audio_output, lbl_cw);
 
     uint8_t g_lt[3], g_gt[3], g_side[3];
     get_glyph3x7('<', g_lt);
@@ -2188,6 +2341,7 @@ typedef struct {
     oled_conn_mode_t conn_mode;
     uint8_t          mods;
     bool             caps;
+    uint8_t          host_audio_output;
     uint8_t          pressed_rows[5];
     uint16_t         keys[5][6];
     uint16_t         enc_ccw;
@@ -2455,6 +2609,12 @@ static void append_sanitized_lbl(char *dst, uint8_t *pos, uint8_t max_len, const
             ch = '<';
         } else if (ch == CHAR_ARROW_RGHT) {
             ch = '>';
+        } else if (ch == CHAR_ICON_BULB || ch == CHAR_ICON_SPEAKER || ch == CHAR_ICON_HEADPHONES) {
+            const char *tag = (ch == CHAR_ICON_BULB) ? "LT" : ((ch == CHAR_ICON_HEADPHONES) ? "HP" : "SP");
+            for (uint8_t j = 0; j < 2 && (*pos + 1) < max_len; j++) {
+                dst[(*pos)++] = tag[j];
+            }
+            continue;
         }
         dst[(*pos)++] = ch;
     }
@@ -2533,7 +2693,7 @@ static void render_oled_rgb_right(uint8_t *fb, const oled_app_ctx_t *ctx) {
             uint8_t  mat_c   = (uint8_t)(5 - disp_c);
             uint16_t kc      = ctx->keys[r][mat_c];
             char     lbl[4];
-            format_keycode_label(kc, false, false, lbl);
+            format_keycode_label_ex(kc, false, false, ctx->host_audio_output, lbl);
             bool    pressed = (ctx->pressed_rows[r] & (1U << mat_c)) != 0;
             bool    empty   = (kc == KC_NO || kc == KC_TRNS);
             uint8_t cx      = oled_col_x[disp_c];
@@ -2582,7 +2742,7 @@ static void render_oled_rgb_right(uint8_t *fb, const oled_app_ctx_t *ctx) {
 }
 
 static void render_oled_app_keymap(uint8_t *fb, const oled_app_ctx_t *ctx) {
-    render_oled_layout(fb, ctx->is_left, ctx->top_layer, ctx->conn_mode, ctx->mods, ctx->caps, ctx->pressed_rows, ctx->keys, ctx->enc_ccw, ctx->enc_cw);
+    render_oled_layout(fb, ctx->is_left, ctx->top_layer, ctx->conn_mode, ctx->mods, ctx->caps, ctx->host_audio_output, ctx->pressed_rows, ctx->keys, ctx->enc_ccw, ctx->enc_cw);
 }
 
 static void render_oled_app_rgb_info(uint8_t *fb, const oled_app_ctx_t *ctx) {
@@ -2623,16 +2783,18 @@ bool oled_task_user(void) {
     }
 
     if (!is_keyboard_master() && slave_has_hdr && slave_has_keys) {
-        ctx.top_layer = slave_hdr_state.top_layer;
-        ctx.conn_mode = OLED_CONN_TRRS;
-        ctx.mods      = slave_hdr_state.mods;
-        ctx.caps      = (slave_hdr_state.flags & SLAVE_HDR_CAPS_LOCK) != 0;
+        ctx.top_layer         = slave_hdr_state.top_layer;
+        ctx.conn_mode         = OLED_CONN_TRRS;
+        ctx.mods              = slave_hdr_state.mods;
+        ctx.caps              = (slave_hdr_state.flags & SLAVE_HDR_CAPS_LOCK) != 0;
+        ctx.host_audio_output = (uint8_t)((slave_hdr_state.flags & SLAVE_HDR_AUDIO_MASK) >> SLAVE_HDR_AUDIO_SHIFT);
         memcpy(ctx.keys, slave_keys, sizeof(ctx.keys));
         ctx.enc_ccw      = slave_enc_ccw;
         ctx.enc_cw       = slave_enc_cw;
         ctx.peer_enc_ccw = slave_peer_enc_ccw;
         ctx.peer_enc_cw  = slave_peer_enc_cw;
     } else {
+        ctx.host_audio_output = host_audio_output;
         layer_state_t active_mask = layer_state | default_layer_state;
         ctx.top_layer             = get_highest_layer(active_mask);
         ctx.mods                  = get_local_mods();
