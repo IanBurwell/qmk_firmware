@@ -1,0 +1,273 @@
+name: Build & Tag Sofle Pico Firmware
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sofle-pico-build-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  push:
+    branches:
+      - ib-sofle-pico
+    paths:
+      - 'keyboards/sofle_pico/**'
+      - '!keyboards/sofle_pico/keymaps/default/host_sync/**'
+      - 'quantum/rgb_matrix/**'
+      - '.github/workflows/build_sofle_pico.yml'
+  pull_request:
+    branches:
+      - ib-sofle-pico
+    paths:
+      - 'keyboards/sofle_pico/**'
+      - '!keyboards/sofle_pico/keymaps/default/host_sync/**'
+      - 'quantum/rgb_matrix/**'
+      - '.github/workflows/build_sofle_pico.yml'
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type for incremental firmware tag'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - none
+      create_release:
+        description: 'Publish GitHub Release with attached .uf2 firmware'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    name: Build sofle_pico:default UF2
+    runs-on: ubuntu-latest
+    container: ghcr.io/qmk/qmk_cli
+
+    steps:
+      - name: Disable safe.directory check
+        run: git config --global --add safe.directory '*'
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize required RP2040 submodules
+        run: |
+          SUBMODULES="lib/chibios lib/chibios-contrib lib/pico-sdk lib/printf"
+          git submodule sync -- $SUBMODULES
+          git submodule update --init --depth 1 -- $SUBMODULES || git submodule update --init -- $SUBMODULES
+
+      - name: Install QMK Python dependencies
+        run: pip3 install -r requirements.txt
+
+      - name: Compile sofle_pico:default firmware
+        run: qmk compile -kb sofle_pico -km default -j "$(nproc)"
+
+      - name: Validate UF2 image and compute checksum
+        id: validate
+        run: |
+          python3 - <<'EOF'
+          import hashlib
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "keyboards/sofle_pico/keymaps/default/host_sync")
+          import sofle_flash
+
+          uf2_path = Path("sofle_pico_default.uf2")
+          data = uf2_path.read_bytes()
+          blocks = sofle_flash.validate_uf2_bytes(data)
+          digest = hashlib.sha256(data).hexdigest()
+
+          Path("SHA256SUMS.txt").write_text(f"{digest}  {uf2_path.name}\n", encoding="utf-8")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("## Sofle Pico Firmware Build\n\n")
+                  fh.write(f"- **Target:** `sofle_pico:default` (shared Left/Right via `EE_HANDS`)\n")
+                  fh.write(f"- **File:** `{uf2_path.name}` ({len(data)} bytes, {blocks} RP2040 UF2 blocks)\n")
+                  fh.write(f"- **SHA-256:** `{digest}`\n")
+          print(f"Validated {uf2_path.name}: {len(data)} bytes, {blocks} blocks, sha256={digest}")
+          EOF
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sofle-pico-firmware
+          path: |
+            sofle_pico_default.uf2
+            SHA256SUMS.txt
+
+  tag_and_release:
+    name: Incremental Version Tag & Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: >-
+      github.repository == 'IanBurwell/qmk_firmware' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.bump != 'none'))
+
+    steps:
+      - name: Checkout full history & tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download built firmware
+        uses: actions/download-artifact@v8
+        with:
+          name: sofle-pico-firmware
+          path: dist
+
+      - name: Compute incremental version tag
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BUMP: ${{ inputs.bump }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          import re
+          import subprocess
+
+          TAG_PREFIX = "sofle-pico-v"
+          TAG_RE = re.compile(r"^sofle-pico-v(\d+)\.(\d+)\.(\d+)$")
+
+          subprocess.run(["git", "fetch", "--tags", "--force"], check=True)
+          tags_out = subprocess.check_output(["git", "tag", "-l", f"{TAG_PREFIX}*"], text=True)
+
+          versions = []
+          for line in tags_out.splitlines():
+              m = TAG_RE.match(line.strip())
+              if m:
+                  versions.append(((int(m.group(1)), int(m.group(2)), int(m.group(3))), line.strip()))
+
+          head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+
+          prev_tag = ""
+          skip = False
+          if not versions:
+              new_tag = f"{TAG_PREFIX}1.0.0"
+          else:
+              versions.sort(key=lambda item: item[0])
+              (maj, min_, pat), prev_tag = versions[-1]
+              prev_sha = subprocess.check_output(["git", "rev-parse", f"{prev_tag}^{{commit}}"], text=True).strip()
+              if prev_sha == head_sha:
+                  skip = True
+                  new_tag = prev_tag
+              else:
+                  event_name = os.environ.get("EVENT_NAME", "push")
+                  bump = os.environ.get("INPUT_BUMP", "patch").strip().lower()
+                  if event_name != "workflow_dispatch" or bump not in ("major", "minor", "patch"):
+                      commit_msg = subprocess.check_output(["git", "log", "-1", "--pretty=%B"], text=True)
+                      if "#major" in commit_msg:
+                          bump = "major"
+                      elif "#minor" in commit_msg:
+                          bump = "minor"
+                      else:
+                          bump = "patch"
+
+                  if bump == "major":
+                      maj += 1
+                      min_ = 0
+                      pat = 0
+                  elif bump == "minor":
+                      min_ += 1
+                      pat = 0
+                  else:
+                      pat += 1
+                  new_tag = f"{TAG_PREFIX}{maj}.{min_}.{pat}"
+
+          gh_out = os.environ["GITHUB_OUTPUT"]
+          with open(gh_out, "a", encoding="utf-8") as fh:
+              fh.write(f"new_tag={new_tag}\n")
+              fh.write(f"prev_tag={prev_tag}\n")
+              fh.write(f"skip={'true' if skip else 'false'}\n")
+          print(f"prev_tag={prev_tag!r} new_tag={new_tag!r} skip={skip}")
+          EOF
+
+      - name: Create and push incremental tag
+        if: steps.version.outputs.skip != 'true'
+        env:
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$NEW_TAG" -m "Sofle Pico firmware $NEW_TAG"
+          git push origin "refs/tags/$NEW_TAG"
+
+      - name: Prepare release assets & notes
+        if: steps.version.outputs.skip != 'true' && (github.event_name == 'push' || inputs.create_release)
+        env:
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+          PREV_TAG: ${{ steps.version.outputs.prev_tag }}
+        run: |
+          cp dist/sofle_pico_default.uf2 "dist/sofle_pico_default-${NEW_TAG}.uf2"
+          (cd dist && sha256sum sofle_pico_default.uf2 "sofle_pico_default-${NEW_TAG}.uf2" > SHA256SUMS.txt)
+          python3 - <<'EOF'
+          import os
+          import subprocess
+          from pathlib import Path
+
+          new_tag = os.environ["NEW_TAG"]
+          prev_tag = os.environ.get("PREV_TAG", "")
+
+          if prev_tag:
+              log_range = f"{prev_tag}..HEAD"
+              commits = subprocess.check_output(
+                  ["git", "log", "--no-merges", "--pretty=format:- %h %s", log_range], text=True
+              ).strip()
+              changes_hdr = f"### Changes since `{prev_tag}`"
+          else:
+              commits = subprocess.check_output(
+                  ["git", "log", "--no-merges", "-n", "15", "--pretty=format:- %h %s"], text=True
+              ).strip()
+              changes_hdr = "### Recent Commits"
+
+          if not commits:
+              commits = "- Initial versioned firmware build"
+
+          sums = Path("dist/SHA256SUMS.txt").read_text(encoding="utf-8").strip()
+          notes = (
+              f"Automated firmware build for **`sofle_pico:default`** (`{new_tag}`).\n"
+              f"Both Left and Right halves flash the same `.uf2` image (`EE_HANDS` preserved in flash).\n\n"
+              f"{changes_hdr}\n{commits}\n\n"
+              f"### Checksums (`SHA-256`)\n```\n{sums}\n```\n\n"
+              f"### Flashing\n"
+              f"- Dual-USB or TRRS via script: `python keyboards/sofle_pico/keymaps/default/host_sync/sofle_flash.py --uf2 sofle_pico_default.uf2`\n"
+              f"- Manual: double-tap reset / tap `_ADJUST` microchip (`QK_BOOT`), then copy `sofle_pico_default.uf2` onto `RPI-RP2`.\n"
+          )
+          Path("dist/release_notes.md").write_text(notes, encoding="utf-8")
+          EOF
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.skip != 'true' && (github.event_name == 'push' || inputs.create_release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+        run: |
+          gh release create "$NEW_TAG" \
+            --verify-tag \
+            --title "Sofle Pico $NEW_TAG" \
+            --notes-file dist/release_notes.md \
+            dist/sofle_pico_default.uf2 \
+            "dist/sofle_pico_default-${NEW_TAG}.uf2" \
+            dist/SHA256SUMS.txt
+          {
+            echo "## Release Published"
+            echo ""
+            echo "- **Tag:** \`$NEW_TAG\`"
+            echo "- **Assets:** \`sofle_pico_default.uf2\`, \`sofle_pico_default-${NEW_TAG}.uf2\`, \`SHA256SUMS.txt\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Skip notice when HEAD already tagged
+        if: steps.version.outputs.skip == 'true'
+        env:
+          NEW_TAG: ${{ steps.version.outputs.new_tag }}
+        run: echo "HEAD is already tagged at $NEW_TAG; skipping duplicate tag/release." >> "$GITHUB_STEP_SUMMARY"
