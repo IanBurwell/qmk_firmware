@@ -8,6 +8,26 @@ Lightweight host relay that synchronizes **`_LOWER` / `_RAISE` / `_ADJUST` layer
 
 ---
 
+## Quick Install & Update (`_ADJUST + 1`)
+
+Pressing `_ADJUST` Row 0 Col 1 (the **download icon** right next to the bootloader microchip on the Left half) uses QMK `OS_DETECTION_ENABLE` to detect your OS, opens a Run box or terminal, and downloads & runs the latest installer from the `ib-sofle-pico` branch on GitHub (`install.ps1` / `install.sh`):
+
+- **Modifier overrides**: Hold **`Shift`** while pressing the key to force Linux, or hold **`Ctrl`** to force Windows; tap **`Esc`** anytime while typing to cancel.
+- **Idempotent install & updates**: Both installers compare SHA-256 hashes, install or update only changed files, leave any existing `ha_config.json` / `audio_config.json` untouched, configure login auto-start (Windows Startup shortcut or Linux `udev` + `systemd --user`), and start/restart `sofle_sync.py`.
+
+Manual one-liners (useful before flashing or on another machine):
+
+- **Windows (PowerShell)**:
+  ```powershell
+  powershell -NoP -EP Bypass -C "irm https://raw.githubusercontent.com/IanBurwell/qmk_firmware/ib-sofle-pico/keyboards/sofle_pico/keymaps/default/host_sync/install.ps1|iex"
+  ```
+- **Linux / macOS**:
+  ```bash
+  U=https://raw.githubusercontent.com/IanBurwell/qmk_firmware/ib-sofle-pico/keyboards/sofle_pico/keymaps/default/host_sync/install.sh;(curl -fsSL $U||wget -qO- $U)>/tmp/s.sh&&bash /tmp/s.sh
+  ```
+
+---
+
 ## Single-Command Dual-Board Flashing (`sofle_flash.py`)
 
 When both halves are plugged in via USB, you can update both boards sequentially with a single command (zero external dependencies; works cleanly even while `sofle_sync.py` is running in the background):

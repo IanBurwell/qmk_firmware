@@ -24,6 +24,10 @@
 #    include "rgb_matrix.h"
 #endif
 
+#ifdef OS_DETECTION_ENABLE
+#    include "os_detection.h"
+#endif
+
 #include "usb_device_state.h"
 
 #if defined(PROTOCOL_CHIBIOS) && defined(MCU_RP)
@@ -136,6 +140,7 @@ enum sofle_layers {
 enum sofle_keycodes {
     HA_HEX_TOGG = SAFE_RANGE,
     WIN_AUD_SWP,
+    HOST_SYNC_SETUP,
 };
 
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
@@ -162,7 +167,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
                             _______,  _______,  _______,  _______,  _______,        _______,  _______,  _______,  _______,  _______
     ),
     [_ADJUST] = LAYOUT(
-        QK_BOOT,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,                            RM_HUED,  RM_HUEU,  RM_SATD,  RM_SATU,  XXXXXXX,  XXXXXXX,
+        QK_BOOT,  HOST_SYNC_SETUP, XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,                      RM_HUED,  RM_HUEU,  RM_SATD,  RM_SATU,  XXXXXXX,  XXXXXXX,
         XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,                            RM_NEXT,  RM_VALD,  RM_VALU,  RM_TOGG,  RM_SPDU,  XXXXXXX,
         XXXXXXX,  XXXXXXX,  XXXXXXX,  WIN_AUD_SWP, HA_HEX_TOGG, XXXXXXX,                      RM_PREV,  KC_VOLD,  KC_MUTE,  KC_VOLU,  RM_SPDD,  XXXXXXX,
         XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,  XXXXXXX,        XXXXXXX,  RM_TOGG,  _______,  _______,  _______,  XXXXXXX,  XXXXXXX,
@@ -1053,7 +1058,193 @@ static void sync_local_state_if_needed(void) {
     }
 }
 
+#define HOST_SETUP_PRE_DELAY_MS  250U
+#define HOST_SETUP_WIN_WAIT_MS   650U
+#define HOST_SETUP_LIN_WAIT_MS   950U
+#define HOST_SETUP_MAC_SPOT_MS   450U
+#define HOST_SETUP_MAC_WAIT_MS   950U
+#define HOST_SETUP_CHAR_MS       8U
+#define HOST_SETUP_ENTER_WAIT_MS 80U
+
+typedef enum {
+    HOST_SETUP_IDLE = 0,
+    HOST_SETUP_PRE_DELAY,
+    HOST_SETUP_MAC_TERM,
+    HOST_SETUP_WAIT_TERM,
+    HOST_SETUP_TYPING,
+    HOST_SETUP_FINISH,
+} host_setup_stage_t;
+
+typedef enum {
+    HOST_SETUP_OS_WINDOWS = 0,
+    HOST_SETUP_OS_LINUX,
+    HOST_SETUP_OS_MACOS,
+} host_setup_os_t;
+
+static const char PROGMEM host_setup_cmd_win[] =
+    "powershell -NoP -EP Bypass -C \"irm https://raw.githubusercontent.com/IanBurwell/qmk_firmware/ib-sofle-pico/keyboards/sofle_pico/keymaps/default/host_sync/install.ps1|iex\"";
+
+static const char PROGMEM host_setup_cmd_unix[] =
+    "U=https://raw.githubusercontent.com/IanBurwell/qmk_firmware/ib-sofle-pico/keyboards/sofle_pico/keymaps/default/host_sync/install.sh;(curl -fsSL $U||wget -qO- $U)>/tmp/s.sh&&bash /tmp/s.sh";
+
+static const char PROGMEM host_setup_mac_app[] = "Terminal";
+
+static host_setup_stage_t host_setup_stage        = HOST_SETUP_IDLE;
+static host_setup_os_t    host_setup_os           = HOST_SETUP_OS_WINDOWS;
+static const char        *host_setup_ptr          = NULL;
+static uint16_t           host_setup_idx          = 0;
+static uint32_t           host_setup_timer        = 0;
+static uint16_t           host_setup_delay_ms     = 0;
+static bool               host_setup_restore_caps = false;
+
+static host_setup_os_t resolve_host_setup_os(uint8_t mods) {
+    if (mods & MOD_MASK_SHIFT) {
+        return HOST_SETUP_OS_LINUX;
+    }
+    if (mods & MOD_MASK_CTRL) {
+        return HOST_SETUP_OS_WINDOWS;
+    }
+#ifdef OS_DETECTION_ENABLE
+    switch (detected_host_os()) {
+        case OS_LINUX:
+            return HOST_SETUP_OS_LINUX;
+        case OS_MACOS:
+            return HOST_SETUP_OS_MACOS;
+        default:
+            return HOST_SETUP_OS_WINDOWS;
+    }
+#else
+    return HOST_SETUP_OS_WINDOWS;
+#endif
+}
+
+static void host_setup_start(host_setup_os_t target_os) {
+    host_setup_os           = target_os;
+    host_setup_ptr          = (target_os == HOST_SETUP_OS_WINDOWS) ? host_setup_cmd_win : host_setup_cmd_unix;
+    host_setup_idx          = 0;
+    host_setup_restore_caps = false;
+    host_setup_timer        = timer_read32();
+    host_setup_stage        = HOST_SETUP_PRE_DELAY;
+}
+
+static void host_setup_abort(void) {
+    if (host_setup_stage == HOST_SETUP_IDLE) {
+        return;
+    }
+    if (host_setup_restore_caps) {
+        tap_code(KC_CAPS);
+        host_setup_restore_caps = false;
+    }
+    host_setup_stage = HOST_SETUP_IDLE;
+    host_setup_ptr   = NULL;
+    host_setup_idx   = 0;
+}
+
+static void host_setup_launch_terminal(void) {
+    clear_mods();
+    clear_weak_mods();
+    clear_oneshot_mods();
+    send_keyboard_report();
+    if (host_setup_os == HOST_SETUP_OS_WINDOWS) {
+        tap_code16(LGUI(KC_R));
+        host_setup_delay_ms = HOST_SETUP_WIN_WAIT_MS;
+        host_setup_timer    = timer_read32();
+        host_setup_stage    = HOST_SETUP_WAIT_TERM;
+    } else if (host_setup_os == HOST_SETUP_OS_LINUX) {
+        tap_code16(LCTL(LALT(KC_T)));
+        host_setup_delay_ms = HOST_SETUP_LIN_WAIT_MS;
+        host_setup_timer    = timer_read32();
+        host_setup_stage    = HOST_SETUP_WAIT_TERM;
+    } else {
+        tap_code16(LGUI(KC_SPC));
+        host_setup_idx   = 0;
+        host_setup_timer = timer_read32();
+        host_setup_stage = HOST_SETUP_MAC_TERM;
+    }
+}
+
+static void host_setup_task(void) {
+    switch (host_setup_stage) {
+        case HOST_SETUP_IDLE:
+            return;
+
+        case HOST_SETUP_PRE_DELAY:
+            if (timer_elapsed32(host_setup_timer) < HOST_SETUP_PRE_DELAY_MS) {
+                return;
+            }
+            if (host_keyboard_led_state().caps_lock) {
+                tap_code(KC_CAPS);
+                host_setup_restore_caps = true;
+            }
+            host_setup_launch_terminal();
+            return;
+
+        case HOST_SETUP_MAC_TERM: {
+            uint16_t elapsed = (host_setup_idx == 0) ? HOST_SETUP_MAC_SPOT_MS : HOST_SETUP_CHAR_MS;
+            if (timer_elapsed32(host_setup_timer) < elapsed) {
+                return;
+            }
+            char ch = (char)pgm_read_byte(&host_setup_mac_app[host_setup_idx]);
+            if (ch == '\0') {
+                tap_code(KC_ENT);
+                host_setup_idx      = 0;
+                host_setup_delay_ms = HOST_SETUP_MAC_WAIT_MS;
+                host_setup_timer    = timer_read32();
+                host_setup_stage    = HOST_SETUP_WAIT_TERM;
+            } else {
+                send_char(ch);
+                host_setup_idx++;
+                host_setup_timer = timer_read32();
+            }
+            return;
+        }
+
+        case HOST_SETUP_WAIT_TERM:
+            if (timer_elapsed32(host_setup_timer) < host_setup_delay_ms) {
+                return;
+            }
+            host_setup_idx   = 0;
+            host_setup_timer = timer_read32();
+            host_setup_stage = HOST_SETUP_TYPING;
+            return;
+
+        case HOST_SETUP_TYPING: {
+            if (host_setup_idx > 0 && timer_elapsed32(host_setup_timer) < HOST_SETUP_CHAR_MS) {
+                return;
+            }
+            char ch = (char)pgm_read_byte(&host_setup_ptr[host_setup_idx]);
+            if (ch == '\0') {
+                host_setup_timer = timer_read32();
+                host_setup_stage = HOST_SETUP_FINISH;
+            } else {
+                send_char(ch);
+                host_setup_idx++;
+                host_setup_timer = timer_read32();
+            }
+            return;
+        }
+
+        case HOST_SETUP_FINISH:
+            if (timer_elapsed32(host_setup_timer) < HOST_SETUP_ENTER_WAIT_MS) {
+                return;
+            }
+            tap_code(KC_ENT);
+            if (host_setup_restore_caps) {
+                tap_code(KC_CAPS);
+                host_setup_restore_caps = false;
+            }
+            host_setup_stage = HOST_SETUP_IDLE;
+            host_setup_ptr   = NULL;
+            host_setup_idx   = 0;
+            return;
+    }
+}
+
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+    if (host_setup_stage != HOST_SETUP_IDLE && keycode == KC_ESC && record->event.pressed) {
+        host_setup_abort();
+        return false;
+    }
     if (is_keyboard_master() && !is_transport_connected()) {
         if (keycode == QK_TRI_LAYER_LOWER) {
             local_lower_held = record->event.pressed;
@@ -1085,6 +1276,12 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     if (keycode == WIN_AUD_SWP) {
         if (record->event.pressed) {
             host_sync_send_action(HOST_ACTION_AUDIO_SWAP);
+        }
+        return false;
+    }
+    if (keycode == HOST_SYNC_SETUP) {
+        if (record->event.pressed && is_keyboard_master() && host_setup_stage == HOST_SETUP_IDLE) {
+            host_setup_start(resolve_host_setup_os(get_mods() | get_oneshot_mods()));
         }
         return false;
     }
@@ -1282,6 +1479,7 @@ void housekeeping_task_user(void) {
             host_audio_output  = HOST_AUDIO_UNKNOWN;
             host_status_active = false;
         }
+        host_setup_task();
 
         static uint16_t poll_timer               = 0;
         static bool     last_master_btn          = false;
@@ -1442,8 +1640,9 @@ void housekeeping_task_user(void) {
 #    define CHAR_ICON_BRI_DN     ((char)0xA4)
 #    define CHAR_ICON_BOOT       ((char)0xA5)
 #    define CHAR_ICON_EMOJI      ((char)0xA6)
+#    define CHAR_ICON_DOWNLOAD   ((char)0xA7)
 #    define CHAR_ICON_FIRST      CHAR_ICON_BULB
-#    define CHAR_ICON_LAST       CHAR_ICON_EMOJI
+#    define CHAR_ICON_LAST       CHAR_ICON_DOWNLOAD
 #    define CHAR_ICON_COUNT      ((uint8_t)CHAR_ICON_LAST - (uint8_t)CHAR_ICON_FIRST + 1U)
 
 // 5x7 font for single-character labels (ASCII 0x20..0x7E, 5 bytes per character)
@@ -1592,6 +1791,7 @@ static const uint16_t PROGMEM oled_icons7x9[CHAR_ICON_COUNT][7] = {
     {0x010, 0x000, 0x038, 0x0AA, 0x038, 0x000, 0x010}, // 0xA4 CHAR_ICON_BRI_DN (7x7 dim 4-ray hollow sun)
     {0x028, 0x07C, 0x0C6, 0x054, 0x0C6, 0x07C, 0x028}, // 0xA5 CHAR_ICON_BOOT (7x7 QFP microchip)
     {0x038, 0x07C, 0x0D6, 0x0BE, 0x0D6, 0x07C, 0x038}, // 0xA6 CHAR_ICON_EMOJI (7x7 smiley face for Win+.)
+    {0x0C0, 0x088, 0x090, 0x0BE, 0x090, 0x088, 0x0C0}, // 0xA7 CHAR_ICON_DOWNLOAD (download to tray)
 };
 
 static const char PROGMEM oled_icon_ascii_tags[CHAR_ICON_COUNT][2] = {
@@ -1601,7 +1801,7 @@ static const char PROGMEM oled_icon_ascii_tags[CHAR_ICON_COUNT][2] = {
     {'P', 'U'}, {'P', 'D'}, {'W', 'U'}, {'W', 'D'}, {'P', 'S'}, {'A', 'P'},
     {'C', 'L'}, {'H', 'M'}, {'E', 'D'}, {'A', 'L'}, {'C', 'T'}, {'L', 'W'},
     {'R', 'S'}, {'^', '<'}, {'^', '>'}, {'!', '4'}, {'R', 'G'}, {'B', '+'},
-    {'B', '-'}, {'B', 'T'}, {'G', '.'},
+    {'B', '-'}, {'B', 'T'}, {'G', '.'}, {'D', 'N'},
 };
 
 static void get_glyph3x7(char c, uint8_t out[3]) {
@@ -1995,6 +2195,9 @@ static void format_keycode_label_ex(uint16_t kc, bool shift, bool caps, uint8_t 
         case HA_HEX_TOGG: out[0] = CHAR_ICON_BULB; return;
         case WIN_AUD_SWP:
             out[0] = (audio_output == HOST_AUDIO_SPEAKER) ? CHAR_ICON_HEADPHONES : CHAR_ICON_SPEAKER;
+            return;
+        case HOST_SYNC_SETUP:
+            out[0] = CHAR_ICON_DOWNLOAD;
             return;
         case QK_BOOT: out[0] = CHAR_ICON_BOOT;  return;
         case QK_RBT:  out[0] = 'R'; out[1] = 'B'; return;
