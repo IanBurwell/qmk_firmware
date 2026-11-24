@@ -157,8 +157,8 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     [_RAISE] = LAYOUT(
         _______,  _______,  _______,  _______,  _______,  _______,                            _______,  _______,  _______,  _______,  _______,  _______,
         _______,  KC_INS,   KC_PSCR,  KC_APP,   KC_CAPS,  A(KC_F4),                           KC_HOME,  C(KC_LEFT), KC_UP,  C(KC_RGHT), KC_END, C(KC_BSPC),
-        _______,  KC_LALT,  KC_LCTL,  KC_LSFT,  XXXXXXX,  KC_CALC,                            KC_PGUP,  KC_LEFT,  KC_DOWN,  KC_RGHT,  KC_BSPC,  KC_DEL,
-        _______,  C(KC_Z),  C(KC_X),  C(KC_C),  C(KC_V),  XXXXXXX,  _______,        _______,  KC_PGDN,  KC_MPRV,  KC_MPLY,  KC_MNXT,  XXXXXXX,  _______,
+        _______,  G(KC_1),  G(KC_2),  G(KC_3),  G(KC_4),  KC_CALC,                            KC_PGUP,  KC_LEFT,  KC_DOWN,  KC_RGHT,  KC_BSPC,  KC_DEL,
+        _______,  C(KC_Z),  C(KC_X),  C(KC_C),  C(KC_V),  G(KC_DOT), _______,       _______,  KC_PGDN,  KC_MPRV,  KC_MPLY,  KC_MNXT,  XXXXXXX,  _______,
                             _______,  _______,  _______,  _______,  _______,        _______,  _______,  _______,  _______,  _______
     ),
     [_ADJUST] = LAYOUT(
@@ -1273,19 +1273,11 @@ void housekeeping_task_user(void) {
         bool trrs_connected = is_transport_connected();
         if (trrs_connected) {
             clear_dual_usb_peer_state();
-            // Solid LED on TRRS master half
-            gpio_write_pin_high(USR_LED_PIN);
-        } else {
-            if (host_service_connected && timer_elapsed32(host_service_last_rx) > HOST_SYNC_TIMEOUT_MS) {
-                clear_host_sync_state();
-            }
-            // Dual-USB mode LED indicator: solid on Left when synced, Caps Lock on Right
-            if (is_keyboard_left()) {
-                gpio_write_pin(USR_LED_PIN, host_service_connected && host_peer_connected);
-            } else {
-                gpio_write_pin(USR_LED_PIN, host_keyboard_led_state().caps_lock);
-            }
+        } else if (host_service_connected && timer_elapsed32(host_service_last_rx) > HOST_SYNC_TIMEOUT_MS) {
+            clear_host_sync_state();
         }
+        // Caps Lock indicator on master half (TRRS master & both Dual-USB halves)
+        gpio_write_pin(USR_LED_PIN, host_keyboard_led_state().caps_lock);
         if (host_status_active && timer_elapsed32(host_status_last_rx) > HOST_SYNC_TIMEOUT_MS) {
             host_audio_output  = HOST_AUDIO_UNKNOWN;
             host_status_active = false;
@@ -1449,8 +1441,9 @@ void housekeeping_task_user(void) {
 #    define CHAR_ICON_BRI_UP     ((char)0xA3)
 #    define CHAR_ICON_BRI_DN     ((char)0xA4)
 #    define CHAR_ICON_BOOT       ((char)0xA5)
+#    define CHAR_ICON_EMOJI      ((char)0xA6)
 #    define CHAR_ICON_FIRST      CHAR_ICON_BULB
-#    define CHAR_ICON_LAST       CHAR_ICON_BOOT
+#    define CHAR_ICON_LAST       CHAR_ICON_EMOJI
 #    define CHAR_ICON_COUNT      ((uint8_t)CHAR_ICON_LAST - (uint8_t)CHAR_ICON_FIRST + 1U)
 
 // 5x7 font for single-character labels (ASCII 0x20..0x7E, 5 bytes per character)
@@ -1598,6 +1591,7 @@ static const uint16_t PROGMEM oled_icons7x9[CHAR_ICON_COUNT][7] = {
     {0x010, 0x044, 0x038, 0x0BA, 0x038, 0x044, 0x010}, // 0xA3 CHAR_ICON_BRI_UP (7x7 bright 8-ray solid sun)
     {0x010, 0x000, 0x038, 0x0AA, 0x038, 0x000, 0x010}, // 0xA4 CHAR_ICON_BRI_DN (7x7 dim 4-ray hollow sun)
     {0x028, 0x07C, 0x0C6, 0x054, 0x0C6, 0x07C, 0x028}, // 0xA5 CHAR_ICON_BOOT (7x7 QFP microchip)
+    {0x038, 0x07C, 0x0D6, 0x0BE, 0x0D6, 0x07C, 0x038}, // 0xA6 CHAR_ICON_EMOJI (7x7 smiley face for Win+.)
 };
 
 static const char PROGMEM oled_icon_ascii_tags[CHAR_ICON_COUNT][2] = {
@@ -1607,7 +1601,7 @@ static const char PROGMEM oled_icon_ascii_tags[CHAR_ICON_COUNT][2] = {
     {'P', 'U'}, {'P', 'D'}, {'W', 'U'}, {'W', 'D'}, {'P', 'S'}, {'A', 'P'},
     {'C', 'L'}, {'H', 'M'}, {'E', 'D'}, {'A', 'L'}, {'C', 'T'}, {'L', 'W'},
     {'R', 'S'}, {'^', '<'}, {'^', '>'}, {'!', '4'}, {'R', 'G'}, {'B', '+'},
-    {'B', '-'}, {'B', 'T'},
+    {'B', '-'}, {'B', 'T'}, {'G', '.'},
 };
 
 static void get_glyph3x7(char c, uint8_t out[3]) {
@@ -1658,6 +1652,7 @@ static void get_glyph3x7(char c, uint8_t out[3]) {
         case '%': out[0] = 0x61; out[1] = 0x1C; out[2] = 0x43; break;
         case ':': out[0] = 0x00; out[1] = 0x14; out[2] = 0x00; break;
         case '#': out[0] = 0x14; out[1] = 0x7F; out[2] = 0x14; break;
+        case '.': out[0] = 0x00; out[1] = 0x60; out[2] = 0x00; break;
         case ' ': out[0] = 0x00; out[1] = 0x00; out[2] = 0x00; break;
         default:  out[0] = 0x02; out[1] = 0x59; out[2] = 0x06; break;
     }
@@ -1703,7 +1698,7 @@ static char basic_to_ascii(uint8_t kc, bool shift, bool caps) {
 }
 
 static char basic_to_short_char(uint8_t kc) {
-    char c = basic_to_ascii(kc, true, false);
+    char c = basic_to_ascii(kc, false, true);
     if (c != 0) {
         if (c >= 'a' && c <= 'z') {
             return (char)(c - 'a' + 'A');
@@ -1777,6 +1772,10 @@ static void format_keycode_label_ex(uint16_t kc, bool shift, bool caps, uint8_t 
         }
         if (has_ctl && !has_alt && !has_gui && !has_sft && base == KC_RGHT) {
             out[0] = CHAR_ICON_WORD_RGHT;
+            return;
+        }
+        if (has_gui && !has_ctl && !has_alt && !has_sft && base == KC_DOT) {
+            out[0] = CHAR_ICON_EMOJI;
             return;
         }
 
