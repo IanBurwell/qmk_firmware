@@ -156,9 +156,9 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     ),
     [_RAISE] = LAYOUT(
         _______,  _______,  _______,  _______,  _______,  _______,                            _______,  _______,  _______,  _______,  _______,  _______,
-        _______,  KC_INS,   KC_PSCR,  KC_APP,   KC_CAPS,  A(KC_F4),                           KC_PGUP,  C(KC_LEFT), KC_UP,  C(KC_RGHT), XXXXXXX, C(KC_BSPC),
-        _______,  KC_LALT,  KC_LCTL,  KC_LSFT,  XXXXXXX,  KC_CALC,                            KC_PGDN,  KC_LEFT,  KC_DOWN,  KC_RGHT,  KC_BSPC,  KC_DEL,
-        _______,  C(KC_Z),  C(KC_X),  C(KC_C),  C(KC_V),  XXXXXXX,  _______,        _______,  XXXXXXX,  KC_MPRV,  KC_MPLY,  KC_MNXT,  XXXXXXX,  _______,
+        _______,  KC_INS,   KC_PSCR,  KC_APP,   KC_CAPS,  A(KC_F4),                           KC_HOME,  C(KC_LEFT), KC_UP,  C(KC_RGHT), KC_END, C(KC_BSPC),
+        _______,  KC_LALT,  KC_LCTL,  KC_LSFT,  XXXXXXX,  KC_CALC,                            KC_PGUP,  KC_LEFT,  KC_DOWN,  KC_RGHT,  KC_BSPC,  KC_DEL,
+        _______,  C(KC_Z),  C(KC_X),  C(KC_C),  C(KC_V),  XXXXXXX,  _______,        _______,  KC_PGDN,  KC_MPRV,  KC_MPLY,  KC_MNXT,  XXXXXXX,  _______,
                             _______,  _______,  _______,  _______,  _______,        _______,  _______,  _______,  _______,  _______
     ),
     [_ADJUST] = LAYOUT(
@@ -1411,9 +1411,47 @@ void housekeeping_task_user(void) {
 #    define CHAR_ARROW_DOWN '\x02'
 #    define CHAR_ARROW_LEFT '\x03'
 #    define CHAR_ARROW_RGHT '\x04'
-#    define CHAR_ICON_BULB       '\x05'
-#    define CHAR_ICON_SPEAKER    '\x06'
-#    define CHAR_ICON_HEADPHONES '\x07'
+#    define CHAR_ICON_BULB       ((char)0x80)
+#    define CHAR_ICON_SPEAKER    ((char)0x81)
+#    define CHAR_ICON_HEADPHONES ((char)0x82)
+#    define CHAR_ICON_TAB        ((char)0x83)
+#    define CHAR_ICON_BSPC       ((char)0x84)
+#    define CHAR_ICON_DEL        ((char)0x85)
+#    define CHAR_ICON_ENTER      ((char)0x86)
+#    define CHAR_ICON_SPACE      ((char)0x87)
+#    define CHAR_ICON_SHIFT      ((char)0x88)
+#    define CHAR_ICON_CAPS       ((char)0x89)
+#    define CHAR_ICON_GUI        ((char)0x8A)
+#    define CHAR_ICON_PLAY       ((char)0x8B)
+#    define CHAR_ICON_STOP       ((char)0x8C)
+#    define CHAR_ICON_PREV       ((char)0x8D)
+#    define CHAR_ICON_NEXT       ((char)0x8E)
+#    define CHAR_ICON_MUTE       ((char)0x8F)
+#    define CHAR_ICON_VOLU       ((char)0x90)
+#    define CHAR_ICON_VOLD       ((char)0x91)
+#    define CHAR_ICON_PGUP       ((char)0x92)
+#    define CHAR_ICON_PGDN       ((char)0x93)
+#    define CHAR_ICON_SCRL_UP    ((char)0x94)
+#    define CHAR_ICON_SCRL_DN    ((char)0x95)
+#    define CHAR_ICON_PSCR       ((char)0x96)
+#    define CHAR_ICON_MENU       ((char)0x97)
+#    define CHAR_ICON_CALC       ((char)0x98)
+#    define CHAR_ICON_HOME       ((char)0x99)
+#    define CHAR_ICON_END        ((char)0x9A)
+#    define CHAR_ICON_ALT        ((char)0x9B)
+#    define CHAR_ICON_CTL        ((char)0x9C)
+#    define CHAR_ICON_LOWER      ((char)0x9D)
+#    define CHAR_ICON_RAISE      ((char)0x9E)
+#    define CHAR_ICON_WORD_LEFT  ((char)0x9F)
+#    define CHAR_ICON_WORD_RGHT  ((char)0xA0)
+#    define CHAR_ICON_CLOSE      ((char)0xA1)
+#    define CHAR_ICON_POWER      ((char)0xA2)
+#    define CHAR_ICON_BRI_UP     ((char)0xA3)
+#    define CHAR_ICON_BRI_DN     ((char)0xA4)
+#    define CHAR_ICON_BOOT       ((char)0xA5)
+#    define CHAR_ICON_FIRST      CHAR_ICON_BULB
+#    define CHAR_ICON_LAST       CHAR_ICON_BOOT
+#    define CHAR_ICON_COUNT      ((uint8_t)CHAR_ICON_LAST - (uint8_t)CHAR_ICON_FIRST + 1U)
 
 // 5x7 font for single-character labels (ASCII 0x20..0x7E, 5 bytes per character)
 static const uint8_t PROGMEM oled_font5x7[][5] = {
@@ -1521,10 +1559,55 @@ static const uint8_t PROGMEM oled_arrows5x7[4][5] = {
     {0x08, 0x08, 0x2A, 0x1C, 0x08}, // CHAR_ARROW_RGHT
 };
 
-static const uint16_t PROGMEM oled_icons7x9[3][7] = {
-    {0x00C, 0x012, 0x0E1, 0x1A1, 0x0E1, 0x012, 0x00C}, // CHAR_ICON_BULB (7x9)
-    {0x038, 0x038, 0x07C, 0x0FE, 0x000, 0x082, 0x07C}, // CHAR_ICON_SPEAKER (7x7 centered in 7x9)
-    {0x078, 0x0F4, 0x002, 0x002, 0x002, 0x0F4, 0x078}, // CHAR_ICON_HEADPHONES (7x7 centered in 7x9)
+static const uint16_t PROGMEM oled_icons7x9[CHAR_ICON_COUNT][7] = {
+    {0x00C, 0x012, 0x0E1, 0x1A1, 0x0E1, 0x012, 0x00C}, // 0x05 CHAR_ICON_BULB
+    {0x038, 0x038, 0x07C, 0x0FE, 0x000, 0x082, 0x07C}, // 0x06 CHAR_ICON_SPEAKER
+    {0x078, 0x0F4, 0x002, 0x002, 0x002, 0x0F4, 0x078}, // 0x07 CHAR_ICON_HEADPHONES
+    {0x04E, 0x040, 0x044, 0x0EE, 0x044, 0x004, 0x0E4}, // 0x08 CHAR_ICON_TAB (|<- / ->|)
+    {0x010, 0x038, 0x07C, 0x054, 0x06C, 0x054, 0x07C}, // 0x09 CHAR_ICON_BSPC (<x] filled tag)
+    {0x07C, 0x054, 0x06C, 0x054, 0x07C, 0x038, 0x010}, // 0x0A CHAR_ICON_DEL ([x> filled tag)
+    {0x020, 0x070, 0x0A8, 0x020, 0x020, 0x020, 0x03E}, // 0x0B CHAR_ICON_ENTER (bent return arrow)
+    {0x070, 0x040, 0x040, 0x040, 0x040, 0x040, 0x070}, // 0x0C CHAR_ICON_SPACE (low U bracket)
+    {0x010, 0x018, 0x0F4, 0x082, 0x0F4, 0x018, 0x010}, // 0x0D CHAR_ICON_SHIFT (hollow up arrow)
+    {0x008, 0x00C, 0x0BA, 0x0A1, 0x0BA, 0x00C, 0x008}, // 0x0E CHAR_ICON_CAPS (hollow arrow + lock bar)
+    {0x0EE, 0x0EE, 0x0EE, 0x000, 0x0EE, 0x0EE, 0x0EE}, // 0x0F CHAR_ICON_GUI (4-pane Super/Win grid)
+    {0x07C, 0x038, 0x010, 0x000, 0x07C, 0x000, 0x07C}, // 0x10 CHAR_ICON_PLAY (play/pause)
+    {0x000, 0x07C, 0x07C, 0x07C, 0x07C, 0x07C, 0x000}, // 0x11 CHAR_ICON_STOP (5x5 square)
+    {0x000, 0x07C, 0x000, 0x010, 0x038, 0x07C, 0x000}, // 0x12 CHAR_ICON_PREV (|<)
+    {0x000, 0x07C, 0x038, 0x010, 0x000, 0x07C, 0x000}, // 0x13 CHAR_ICON_NEXT (>|)
+    {0x038, 0x07C, 0x0FE, 0x000, 0x028, 0x010, 0x028}, // 0x14 CHAR_ICON_MUTE (speaker + x)
+    {0x038, 0x07C, 0x0FE, 0x000, 0x010, 0x038, 0x010}, // 0x15 CHAR_ICON_VOLU (speaker + +)
+    {0x038, 0x07C, 0x0FE, 0x000, 0x010, 0x010, 0x010}, // 0x16 CHAR_ICON_VOLD (speaker + -)
+    {0x000, 0x088, 0x044, 0x022, 0x044, 0x088, 0x000}, // 0x17 CHAR_ICON_PGUP (double up chevron)
+    {0x000, 0x022, 0x044, 0x088, 0x044, 0x022, 0x000}, // 0x18 CHAR_ICON_PGDN (double down chevron)
+    {0x000, 0x0F0, 0x10A, 0x13B, 0x10A, 0x0F0, 0x000}, // 0x19 CHAR_ICON_SCRL_UP (arrow + mouse)
+    {0x000, 0x01E, 0x0A1, 0x1A7, 0x0A1, 0x01E, 0x000}, // 0x1A CHAR_ICON_SCRL_DN (mouse + arrow)
+    {0x0F8, 0x0F8, 0x08C, 0x0AC, 0x08C, 0x0F8, 0x0F8}, // 0x1B CHAR_ICON_PSCR (camera)
+    {0x092, 0x000, 0x092, 0x092, 0x092, 0x092, 0x092}, // 0x1C CHAR_ICON_MENU (bulleted 3-line menu)
+    {0x0FE, 0x101, 0x155, 0x105, 0x155, 0x101, 0x0FE}, // 0x1D CHAR_ICON_CALC (calculator)
+    {0x07C, 0x000, 0x010, 0x038, 0x054, 0x010, 0x010}, // 0x99 CHAR_ICON_HOME (|<-- arrow to bar)
+    {0x010, 0x010, 0x054, 0x038, 0x010, 0x000, 0x07C}, // 0x9A CHAR_ICON_END (-->| arrow to bar)
+    {0x004, 0x004, 0x008, 0x010, 0x024, 0x044, 0x044}, // 0x9B CHAR_ICON_ALT (Option switch)
+    {0x040, 0x060, 0x030, 0x018, 0x030, 0x060, 0x040}, // 0x9C CHAR_ICON_CTL (bold caret)
+    {0x008, 0x018, 0x038, 0x078, 0x038, 0x018, 0x008}, // 0x9D CHAR_ICON_LOWER (solid down triangle)
+    {0x040, 0x060, 0x070, 0x078, 0x070, 0x060, 0x040}, // 0x9E CHAR_ICON_RAISE (solid up triangle)
+    {0x010, 0x028, 0x044, 0x000, 0x010, 0x028, 0x044}, // 0x9F CHAR_ICON_WORD_LEFT (double left chevron)
+    {0x044, 0x028, 0x010, 0x000, 0x044, 0x028, 0x010}, // 0xA0 CHAR_ICON_WORD_RGHT (double right chevron)
+    {0x0FE, 0x082, 0x0AA, 0x092, 0x0AA, 0x082, 0x0FE}, // 0xA1 CHAR_ICON_CLOSE (boxed X)
+    {0x038, 0x044, 0x080, 0x09E, 0x080, 0x044, 0x038}, // 0xA2 CHAR_ICON_POWER (7x7 power symbol)
+    {0x010, 0x044, 0x038, 0x0BA, 0x038, 0x044, 0x010}, // 0xA3 CHAR_ICON_BRI_UP (7x7 bright 8-ray solid sun)
+    {0x010, 0x000, 0x038, 0x0AA, 0x038, 0x000, 0x010}, // 0xA4 CHAR_ICON_BRI_DN (7x7 dim 4-ray hollow sun)
+    {0x028, 0x07C, 0x0C6, 0x054, 0x0C6, 0x07C, 0x028}, // 0xA5 CHAR_ICON_BOOT (7x7 QFP microchip)
+};
+
+static const char PROGMEM oled_icon_ascii_tags[CHAR_ICON_COUNT][2] = {
+    {'L', 'T'}, {'S', 'P'}, {'H', 'P'}, {'T', 'B'}, {'B', 'S'}, {'D', 'L'},
+    {'E', 'N'}, {'S', 'P'}, {'S', 'F'}, {'C', 'P'}, {'G', 'U'}, {'P', 'L'},
+    {'S', 'T'}, {'<', '<'}, {'>', '>'}, {'M', 'U'}, {'V', '+'}, {'V', '-'},
+    {'P', 'U'}, {'P', 'D'}, {'W', 'U'}, {'W', 'D'}, {'P', 'S'}, {'A', 'P'},
+    {'C', 'L'}, {'H', 'M'}, {'E', 'D'}, {'A', 'L'}, {'C', 'T'}, {'L', 'W'},
+    {'R', 'S'}, {'^', '<'}, {'^', '>'}, {'!', '4'}, {'R', 'G'}, {'B', '+'},
+    {'B', '-'}, {'B', 'T'},
 };
 
 static void get_glyph3x7(char c, uint8_t out[3]) {
@@ -1684,6 +1767,19 @@ static void format_keycode_label_ex(uint16_t kc, bool shift, bool caps, uint8_t 
             return;
         }
 
+        if (has_alt && !has_ctl && !has_gui && !has_sft && base == KC_F4) {
+            out[0] = CHAR_ICON_CLOSE;
+            return;
+        }
+        if (has_ctl && !has_alt && !has_gui && !has_sft && base == KC_LEFT) {
+            out[0] = CHAR_ICON_WORD_LEFT;
+            return;
+        }
+        if (has_ctl && !has_alt && !has_gui && !has_sft && base == KC_RGHT) {
+            out[0] = CHAR_ICON_WORD_RGHT;
+            return;
+        }
+
         if (has_alt && !has_ctl && !has_gui && base >= KC_F1 && base <= KC_F9) {
             out[0] = '!';
             out[1] = 'F';
@@ -1734,25 +1830,21 @@ static void format_keycode_label_ex(uint16_t kc, bool shift, bool caps, uint8_t 
     }
 
     if (kc == TL_LOWR) {
-        out[0] = 'L';
-        out[1] = 'W';
+        out[0] = CHAR_ICON_LOWER;
         return;
     }
     if (kc == TL_UPPR) {
-        out[0] = 'R';
-        out[1] = 'S';
+        out[0] = CHAR_ICON_RAISE;
         return;
     }
     if (IS_QK_MOMENTARY(kc)) {
         uint8_t l = kc & 0x1F;
         if (l == 1) {
-            out[0] = 'L';
-            out[1] = 'W';
+            out[0] = CHAR_ICON_LOWER;
             return;
         }
         if (l == 2) {
-            out[0] = 'R';
-            out[1] = 'S';
+            out[0] = CHAR_ICON_RAISE;
             return;
         }
         if (l == 3) {
@@ -1792,22 +1884,18 @@ static void format_keycode_label_ex(uint16_t kc, bool shift, bool caps, uint8_t 
     if (IS_QK_ONE_SHOT_MOD(kc)) {
         uint8_t m = kc & 0x1F;
         if (m & 0x02) {
-            out[0] = 'S';
-            out[1] = 'F';
+            out[0] = CHAR_ICON_SHIFT;
             return;
         }
         if (m & 0x01) {
-            out[0] = 'C';
-            out[1] = 'T';
+            out[0] = CHAR_ICON_CTL;
             return;
         }
         if (m & 0x04) {
-            out[0] = 'A';
-            out[1] = 'L';
+            out[0] = CHAR_ICON_ALT;
             return;
         }
-        out[0] = 'G';
-        out[1] = 'U';
+        out[0] = CHAR_ICON_GUI;
         return;
     }
     if (IS_QK_MACRO(kc)) {
@@ -1818,50 +1906,50 @@ static void format_keycode_label_ex(uint16_t kc, bool shift, bool caps, uint8_t 
     }
 
     switch (kc) {
-        case KC_TAB:  out[0] = 'T'; out[1] = 'B'; return;
+        case KC_TAB:  out[0] = CHAR_ICON_TAB;   return;
         case KC_ESC:  out[0] = 'E'; out[1] = 'S'; return;
-        case KC_BSPC: out[0] = 'B'; out[1] = 'S'; return;
-        case KC_DEL:  out[0] = 'D'; out[1] = 'L'; return;
-        case KC_SPC:  out[0] = 'S'; out[1] = 'P'; return;
+        case KC_BSPC: out[0] = CHAR_ICON_BSPC;  return;
+        case KC_DEL:  out[0] = CHAR_ICON_DEL;   return;
+        case KC_SPC:  out[0] = CHAR_ICON_SPACE; return;
         case KC_ENT:
-        case KC_PENT: out[0] = 'E'; out[1] = 'N'; return;
+        case KC_PENT: out[0] = CHAR_ICON_ENTER; return;
         case KC_LSFT:
-        case KC_RSFT: out[0] = 'S'; out[1] = 'F'; return;
+        case KC_RSFT: out[0] = CHAR_ICON_SHIFT; return;
         case KC_LCTL:
-        case KC_RCTL: out[0] = 'C'; out[1] = 'T'; return;
+        case KC_RCTL: out[0] = CHAR_ICON_CTL;   return;
         case KC_LALT:
-        case KC_RALT: out[0] = 'A'; out[1] = 'L'; return;
+        case KC_RALT: out[0] = CHAR_ICON_ALT;   return;
         case KC_LGUI:
-        case KC_RGUI: out[0] = 'G'; out[1] = 'U'; return;
+        case KC_RGUI: out[0] = CHAR_ICON_GUI;   return;
         case KC_INS:  out[0] = 'I'; out[1] = 'N'; return;
-        case KC_PSCR: out[0] = 'P'; out[1] = 'S'; return;
+        case KC_PSCR: out[0] = CHAR_ICON_PSCR;  return;
         case KC_SCRL: out[0] = 'S'; out[1] = 'L'; return;
         case KC_PAUS: out[0] = 'P'; out[1] = 'A'; return;
-        case KC_APP:  out[0] = 'A'; out[1] = 'P'; return;
-        case KC_CAPS: out[0] = 'C'; out[1] = 'P'; return;
-        case KC_CALC: out[0] = 'C'; out[1] = 'L'; return;
-        case KC_HOME: out[0] = 'H'; out[1] = 'M'; return;
-        case KC_END:  out[0] = 'E'; out[1] = 'D'; return;
-        case KC_PGUP: out[0] = 'P'; out[1] = 'U'; return;
-        case KC_PGDN: out[0] = 'P'; out[1] = 'D'; return;
+        case KC_APP:  out[0] = CHAR_ICON_MENU;  return;
+        case KC_CAPS: out[0] = CHAR_ICON_CAPS;  return;
+        case KC_CALC: out[0] = CHAR_ICON_CALC;  return;
+        case KC_HOME: out[0] = CHAR_ICON_HOME;  return;
+        case KC_END:  out[0] = CHAR_ICON_END;   return;
+        case KC_PGUP: out[0] = CHAR_ICON_PGUP;  return;
+        case KC_PGDN: out[0] = CHAR_ICON_PGDN;  return;
         case KC_UP:   out[0] = CHAR_ARROW_UP;   return;
         case KC_DOWN: out[0] = CHAR_ARROW_DOWN; return;
         case KC_LEFT: out[0] = CHAR_ARROW_LEFT; return;
         case KC_RGHT: out[0] = CHAR_ARROW_RGHT; return;
-        case KC_MPLY: out[0] = 'P'; out[1] = 'L'; return;
-        case KC_MSTP: out[0] = 'S'; out[1] = 'T'; return;
+        case KC_MPLY: out[0] = CHAR_ICON_PLAY;  return;
+        case KC_MSTP: out[0] = CHAR_ICON_STOP;  return;
         case KC_MUTE:
-        case KC_KB_MUTE: out[0] = 'M'; out[1] = 'U'; return;
+        case KC_KB_MUTE: out[0] = CHAR_ICON_MUTE; return;
         case KC_VOLU:
-        case KC_KB_VOLUME_UP: out[0] = 'V'; out[1] = '+'; return;
+        case KC_KB_VOLUME_UP: out[0] = CHAR_ICON_VOLU; return;
         case KC_VOLD:
-        case KC_KB_VOLUME_DOWN: out[0] = 'V'; out[1] = '-'; return;
+        case KC_KB_VOLUME_DOWN: out[0] = CHAR_ICON_VOLD; return;
         case KC_MNXT:
-        case KC_MFFD: out[0] = '>'; out[1] = '>'; return;
+        case KC_MFFD: out[0] = CHAR_ICON_NEXT;  return;
         case KC_MPRV:
-        case KC_MRWD: out[0] = '<'; out[1] = '<'; return;
-        case KC_BRIU: out[0] = 'B'; out[1] = '+'; return;
-        case KC_BRID: out[0] = 'B'; out[1] = '-'; return;
+        case KC_MRWD: out[0] = CHAR_ICON_PREV;  return;
+        case KC_BRIU: out[0] = CHAR_ICON_BRI_UP; return;
+        case KC_BRID: out[0] = CHAR_ICON_BRI_DN; return;
         case KC_EJCT: out[0] = 'E'; out[1] = 'J'; return;
         case KC_PWR:  out[0] = 'P'; out[1] = 'W'; return;
         case KC_SLEP: out[0] = 'Z'; out[1] = 'Z'; return;
@@ -1872,11 +1960,11 @@ static void format_keycode_label_ex(uint16_t kc, bool shift, bool caps, uint8_t 
         case KC_COPY: out[0] = 'C'; out[1] = 'C'; return;
         case KC_PSTE: out[0] = 'C'; out[1] = 'V'; return;
         case KC_FIND: out[0] = 'F'; out[1] = 'D'; return;
-        case KC_MENU: out[0] = 'M'; out[1] = 'N'; return;
+        case KC_MENU: out[0] = CHAR_ICON_MENU;  return;
         case KC_PEQL: out[0] = '='; return;
         case KC_PCMM: out[0] = ','; return;
-        case MS_WHLU: out[0] = 'W'; out[1] = 'U'; return;
-        case MS_WHLD: out[0] = 'W'; out[1] = 'D'; return;
+        case MS_WHLU: out[0] = CHAR_ICON_SCRL_UP; return;
+        case MS_WHLD: out[0] = CHAR_ICON_SCRL_DN; return;
         case MS_WHLL: out[0] = 'W'; out[1] = 'L'; return;
         case MS_WHLR: out[0] = 'W'; out[1] = 'R'; return;
         case MS_UP:   out[0] = 'M'; out[1] = 'U'; return;
@@ -1894,22 +1982,22 @@ static void format_keycode_label_ex(uint16_t kc, bool shift, bool caps, uint8_t 
             out[0] = 'M';
             out[1] = (char)('1' + (kc - MS_BTN1));
             return;
-        case RM_TOGG: out[0] = 'R'; out[1] = 'G'; return;
+        case RM_TOGG: out[0] = CHAR_ICON_POWER;  return;
         case RM_NEXT: out[0] = 'R'; out[1] = '+'; return;
         case RM_PREV: out[0] = 'R'; out[1] = '-'; return;
         case RM_HUEU: out[0] = 'H'; out[1] = '+'; return;
         case RM_HUED: out[0] = 'H'; out[1] = '-'; return;
         case RM_SATU: out[0] = 'S'; out[1] = '+'; return;
         case RM_SATD: out[0] = 'S'; out[1] = '-'; return;
-        case RM_VALU: out[0] = 'B'; out[1] = '+'; return;
-        case RM_VALD: out[0] = 'B'; out[1] = '-'; return;
+        case RM_VALU: out[0] = CHAR_ICON_BRI_UP; return;
+        case RM_VALD: out[0] = CHAR_ICON_BRI_DN; return;
         case RM_SPDU: out[0] = 'P'; out[1] = '+'; return;
         case RM_SPDD: out[0] = 'P'; out[1] = '-'; return;
         case HA_HEX_TOGG: out[0] = CHAR_ICON_BULB; return;
         case WIN_AUD_SWP:
             out[0] = (audio_output == HOST_AUDIO_SPEAKER) ? CHAR_ICON_HEADPHONES : CHAR_ICON_SPEAKER;
             return;
-        case QK_BOOT: out[0] = 'B'; out[1] = 'T'; return;
+        case QK_BOOT: out[0] = CHAR_ICON_BOOT;  return;
         case QK_RBT:  out[0] = 'R'; out[1] = 'B'; return;
         case EE_CLR:  out[0] = 'E'; out[1] = 'E'; return;
         case CG_SWAP:
@@ -2142,9 +2230,9 @@ static void fb_draw_cell(uint8_t *fb, uint8_t cx, uint8_t cy, const char label[4
     uint8_t ty = (uint8_t)(cy + 3);
     if (label[1] == '\0') {
         uint8_t c = (uint8_t)label[0];
-        if (c >= (uint8_t)CHAR_ICON_BULB && c <= (uint8_t)CHAR_ICON_HEADPHONES) {
+        if (c >= (uint8_t)CHAR_ICON_FIRST && c <= (uint8_t)CHAR_ICON_LAST) {
             uint16_t icon[7];
-            uint8_t  idx = (uint8_t)(c - (uint8_t)CHAR_ICON_BULB);
+            uint8_t  idx = (uint8_t)(c - (uint8_t)CHAR_ICON_FIRST);
             for (uint8_t i = 0; i < 7; i++) {
                 icon[i] = pgm_read_word(&oled_icons7x9[idx][i]);
             }
@@ -2609,10 +2697,10 @@ static void append_sanitized_lbl(char *dst, uint8_t *pos, uint8_t max_len, const
             ch = '<';
         } else if (ch == CHAR_ARROW_RGHT) {
             ch = '>';
-        } else if (ch == CHAR_ICON_BULB || ch == CHAR_ICON_SPEAKER || ch == CHAR_ICON_HEADPHONES) {
-            const char *tag = (ch == CHAR_ICON_BULB) ? "LT" : ((ch == CHAR_ICON_HEADPHONES) ? "HP" : "SP");
+        } else if ((uint8_t)ch >= (uint8_t)CHAR_ICON_FIRST && (uint8_t)ch <= (uint8_t)CHAR_ICON_LAST) {
+            uint8_t idx = (uint8_t)((uint8_t)ch - (uint8_t)CHAR_ICON_FIRST);
             for (uint8_t j = 0; j < 2 && (*pos + 1) < max_len; j++) {
-                dst[(*pos)++] = tag[j];
+                dst[(*pos)++] = (char)pgm_read_byte(&oled_icon_ascii_tags[idx][j]);
             }
             continue;
         }
@@ -2704,16 +2792,27 @@ static void render_oled_rgb_right(uint8_t *fb, const oled_app_ctx_t *ctx) {
 
     fb_draw_hline(fb, 0, 75, OLED_PORTRAIT_W, true);
 
-    static const char *const legend[3][2] = {
+    static const char *const legend[2][2] = {
         {"H:HUE", "S:SAT"},
-        {"B:BRI", "P:SPD"},
-        {"R:MOD", "RG:ON"},
+        {"P:SPD", "R:MOD"},
     };
-    for (uint8_t i = 0; i < 3; i++) {
+    for (uint8_t i = 0; i < 2; i++) {
         uint8_t ly = (uint8_t)(78 + i * 9);
         fb_draw_text3x7(fb, 0, ly, legend[i][0], false);
         fb_draw_text3x7(fb, 33, ly, legend[i][1], false);
     }
+
+    uint16_t icon_bri[7], icon_pwr[7];
+    uint8_t  bri_idx = (uint8_t)((uint8_t)CHAR_ICON_BRI_UP - (uint8_t)CHAR_ICON_FIRST);
+    uint8_t  pwr_idx = (uint8_t)((uint8_t)CHAR_ICON_POWER - (uint8_t)CHAR_ICON_FIRST);
+    for (uint8_t i = 0; i < 7; i++) {
+        icon_bri[i] = pgm_read_word(&oled_icons7x9[bri_idx][i]);
+        icon_pwr[i] = pgm_read_word(&oled_icons7x9[pwr_idx][i]);
+    }
+    fb_draw_cols9(fb, 0, 95, icon_bri, 7, false);
+    fb_draw_text3x7(fb, 8, 96, ":BRI", false);
+    fb_draw_cols9(fb, 33, 95, icon_pwr, 7, false);
+    fb_draw_text3x7(fb, 41, 96, ":ON", false);
 
     fb_draw_hline(fb, 0, 105, OLED_PORTRAIT_W, true);
 
